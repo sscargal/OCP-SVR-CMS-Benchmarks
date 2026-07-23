@@ -24,7 +24,7 @@ DRAM×CXL node pair:
 
 | Phase | Function | What it measures |
 |---|---|---|
-| Interleave ramp | `bandwidth_ramp_interleave()` | Latency + bandwidth vs. core count, for W21/W23/W27 traffic mixed across the DRAM+CXL pair at 90:10, 75:25, and (W21 only) 50:50 ratios, seq and rand |
+| Interleave ramp | `bandwidth_ramp_interleave()` | Latency + bandwidth vs. core count, for W21/W23/W27 traffic mixed across the DRAM+CXL pair at 90:10, 75:25, and (W21 only) 50:50 ratios, seq only (MLC's interleave path doesn't support random access for any of these traffic types) |
 
 `-s`, `-c`, and `-d` each accept **either a single value or a
 comma-separated list** (e.g. `-s 0,1`, `-c 2,3`, `-d 0,1`). A list on any of
@@ -189,7 +189,7 @@ disambiguate results without needing a directory structure:
 | `idle_latency_{seq,rand}_numa_node_<N>.socket_<S>.txt` | `idle_latency` | Idle latency to node `<N>`, generated from socket `<S>` |
 | `bw_node<N>_{seq,rand}_<PATTERN>.socket_<S>.txt` | `bandwidth` | Peak bandwidth to node `<N>` from socket `<S>` for one of the 10 fixed traffic patterns |
 | `bw_ramp.results.node_<N>.R.{seq,rand}.<ratio>.socket_<S>.csv` | `bandwidth_ramp` | Bandwidth/latency vs. core count for node `<N>` from socket `<S>` (`<ratio>` is `100:0` if `<N>` was given via `-d`, `0:100` if via `-c`) |
-| `bw_ramp_interleave.results.node_<D>.node_<C>.<W>.{seq,rand}.<ratio>.socket_<S>.csv` | `bandwidth_ramp_interleave` | Bandwidth/latency vs. core count for the DRAM node `<D>` + CXL node `<C>` pair from socket `<S>`, traffic type `<W>` (W21/W23/W27), at the given DRAM:CXL ratio |
+| `bw_ramp_interleave.results.node_<D>.node_<C>.<W>.seq.<ratio>.socket_<S>.csv` | `bandwidth_ramp_interleave` | Bandwidth/latency vs. core count for the DRAM node `<D>` + CXL node `<C>` pair from socket `<S>`, traffic type `<W>` (W21/W23/W27), at the given DRAM:CXL ratio. Seq only — MLC's interleave path rejects random access for W21/W23/W27 |
 
 The two CSV-producing functions (`bandwidth_ramp`, `bandwidth_ramp_interleave`)
 also write a `Socket` column (first column) into every row, so a CSV opened

@@ -744,10 +744,12 @@ function bandwidth_ramp_interleave() {
     # W27 : 2 reads and 1 non-temporal write (similar to –W7)
     for rdwr in W21 W23 W27 
     do
-      # Random bandwidth option may not be supported for all traffic types on all MLC versions;
-      # rows where MLC rejects the combination will have empty Latency/Bandwidth fields, which
-      # gen_plot.py skips gracefully.
-      for access in seq rand
+      # MLC's dual-address-stream (interleave) per-thread-config path only supports
+      # random access for traffic types R, W2, W5, and W6 ("Random bandwidth option
+      # is supported only for R, W2, W5 and W6 traffic types!"). W21/W23/W27 are the
+      # only codes valid in this dual-stream path and none of them are in that set,
+      # so random access can never succeed here - only seq is attempted.
+      for access in seq
       do
         for ratio in 10 25 50
         do 
