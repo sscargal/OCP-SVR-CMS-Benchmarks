@@ -117,6 +117,16 @@ Optional args:
         1: AVX_512 Option Enabled - Default
       By default, the AVX_512 option is enabled. If the non-AVX512
       version of MLC is being used, this option shall be set to 0
+
+Compare mode:
+
+   ./mlc.sh --compare <run_A_dir_or_json> <run_B_dir_or_json> [-o <output.md>] [-t <threshold_pct>]
+      Compare two prior mlc.sh output directories (or their
+      summary_report.json files directly) and write a Markdown
+      report highlighting which metrics got better or worse -
+      useful for regression testing (run1 vs run2) or comparing
+      one system to another. Needs neither root nor MLC itself.
+      See utils/gen_compare.py --help for all options.
 ```
 
 You must provide at least one of `-c` or `-d`.
@@ -181,6 +191,17 @@ $ sudo ./mlc.sh -s 0 -d 0,1 -c 2,3 -m ./mlc
 $ sudo ./mlc.sh -s 1 -d 0,1 -c 2,3 -m ./mlc
 ```
 
+**Example 6:** Compare two runs — regression testing (run1 vs run2 on the same
+box) or system-to-system. Neither root nor `mlc` is needed for this mode:
+
+```bash
+$ ./mlc.sh --compare ./mlc.sh.myhost.0723-1500 ./mlc.sh.myhost.0724-0900
+$ ./mlc.sh --compare ./mlc.sh.systemA.0723-1500 ./mlc.sh.systemB.0723-1500 -t 5
+```
+
+See [Comparing two runs](#comparing-two-runs) below for what the output looks
+like and how to interpret it.
+
 ## Output files and naming
 
 Each run creates `./mlc.sh.<hostname>.<MMDD-HHMM>/`, containing a flat set of
@@ -198,6 +219,7 @@ disambiguate results without needing a directory structure:
 | `bw_ramp.results.node_<N>.R.{seq,rand}.<ratio>.socket_<S>.csv` | `bandwidth_ramp` | Bandwidth/latency vs. core count for node `<N>` from socket `<S>` (`<ratio>` is `100:0` if `<N>` was given via `-d`, `0:100` if via `-c`) |
 | `bw_ramp_interleave.results.node_<D>.node_<C>.<W>.seq.<ratio>.socket_<S>.csv` | `bandwidth_ramp_interleave` | Bandwidth/latency vs. core count for the DRAM node `<D>` + CXL node `<C>` pair from socket `<S>`, traffic type `<W>` (W21/W23/W27), at the given DRAM:CXL ratio. Seq only — MLC's interleave path rejects random access for W21/W23/W27 |
 | `summary_report.md` | `utils/gen_report.sh` | Auto-generated Markdown summary — system info, which tests ran/succeeded, peak latency/bandwidth tables by Socket→Node and by DRAM+CXL interleave pair, and auto-detected anomalies |
+| `summary_report.json` | `utils/gen_report.sh` | Machine-readable version of `summary_report.md` — same system info, topology, tests-run, and peak-results data, for scripting (e.g. `utils/gen_compare.py`, see [Comparing two runs](#comparing-two-runs)) |
 
 The two CSV-producing functions (`bandwidth_ramp`, `bandwidth_ramp_interleave`)
 also write a `Socket` column (first column) into every row, so a CSV opened
@@ -209,12 +231,14 @@ point `gen_plot.py`/`gen_excel.py` at the one output directory and they'll
 find everything.
 
 At the end of a successful run, `mlc.sh` automatically generates
-`summary_report.md` (via `utils/gen_report.sh`, pure bash/awk — no Python
-venv needed, so unlike charts this one *does* run automatically) and prints
-its path, then prints the exact command to generate charts, e.g.:
+`summary_report.md` **and** `summary_report.json` (via `utils/gen_report.sh`,
+pure bash/awk — no Python venv needed, so unlike charts this one *does* run
+automatically) and prints both paths, then prints the exact command to
+generate charts, e.g.:
 
 ```
-Report: ./mlc.sh.myhost.0723-1500/summary_report.md
+Report written to: ./mlc.sh.myhost.0723-1500/summary_report.md
+JSON report written to: ./mlc.sh.myhost.0723-1500/summary_report.json
 
 To generate charts from the CSV results, run:
   /path/to/IntelMLC/utils/.venv/bin/python /path/to/IntelMLC/utils/gen_plot.py -d "./mlc.sh.myhost.0723-1500"
@@ -224,11 +248,45 @@ Charts aren't generated automatically, to avoid requiring a Python venv
 inside a root-privileged bash tool — see
 [Processing the results](#processing-the-results). `gen_report.sh` can also
 be re-run standalone at any time (e.g. after generating charts separately,
-to pick up the new PNGs into the report's Charts section):
+to pick up the new PNGs into the report's Charts section), regenerating both
+the `.md` and `.json` files:
 
 ```bash
 $ utils/gen_report.sh ./mlc.sh.myhost.0723-1500
 ```
+
+## Comparing two runs
+
+`utils/gen_compare.py` diffs two runs' `summary_report.json` files and
+highlights which metrics got better or worse — useful for regression testing
+(run1 vs run2 on the same box) or comparing one system to another. It's
+plain Python 3 using only the standard library (`json`, `argparse`), so
+unlike `gen_plot.py`/`gen_excel.py` below, **it needs no venv** — the Markdown
+report is a stable, structured format specifically so a second script can
+consume it without re-parsing prose.
+
+```bash
+$ ./mlc.sh --compare ./mlc.sh.myhost.0723-1500 ./mlc.sh.myhost.0724-0900
+# or directly, with options:
+$ ./utils/gen_compare.py ./mlc.sh.systemA.0723-1500 ./mlc.sh.systemB.0723-1500 -t 5 -o comparison.md
+```
+
+Each positional argument accepts either an `mlc.sh` output directory (it
+looks for `summary_report.json` inside) or a path to a `.json` file directly.
+`-t/--threshold` (default `3`, in percent) sets how large a change has to be
+before it's flagged — smaller changes are treated as noise. `--label-a`/
+`--label-b` override the display names (default: each run's hostname).
+
+The output, `comparison_report.md` by default, matches `summary_report.md`'s
+table layout — one row per Socket→Node (and per DRAM+CXL interleave pair) —
+but each metric cell shows `A → B (Δ% marker)`, where the marker is `▲`
+(better), `▼` (worse), or `~` (within the threshold). Bandwidth is
+higher-is-better, latency is lower-is-better. A **Regressions** section at
+the top lists every metric that crossed the threshold worse, worst first, so
+the "what changed" answer doesn't require reading every table row. Nodes
+present in only one of the two runs (e.g. comparing systems with different
+NUMA layouts) are listed separately as "Only in A"/"Only in B" rather than
+guessed at.
 
 ## Processing the results
 

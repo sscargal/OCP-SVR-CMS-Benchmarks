@@ -39,13 +39,81 @@ fi
 
 LOG="${DIR}/mlc.sh.log"
 REPORT="${DIR}/summary_report.md"
+REPORT_JSON="${DIR}/summary_report.json"
 
 # Exclude the report itself (and any prior copy) from every scan below.
 is_report_file() {
   case "${1##*/}" in
-    summary_report.md|*_report.md) return 0 ;;
+    summary_report.md|*_report.md|summary_report.json|*_report.json) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+#################################################################################################
+# JSON helpers - build summary_report.json in pure bash, no jq/python required.
+# Mirrors the pattern used by src/container-runtime/utils/collect_sysinfo.sh.
+#################################################################################################
+
+_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s=$(printf '%s' "$s" | awk 'BEGIN{ORS=""} NR>1{printf "\\n"} {print}')
+  printf '%s' "$s"
+}
+
+# "key": "value" (value escaped; null if empty or "n/a")
+_json_str() {
+  local key="$1" val="$2"
+  if [[ -z "${val}" || "${val}" == "n/a" ]]; then
+    printf '"%s": null' "${key}"
+  else
+    printf '"%s": "%s"' "${key}" "$(_json_escape "${val}")"
+  fi
+}
+
+# "key": value (bare numeric; null if empty/non-numeric/"n/a")
+_json_num() {
+  local key="$1" val="$2"
+  if [[ "${val}" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '"%s": %s' "${key}" "${val}"
+  else
+    printf '"%s": null' "${key}"
+  fi
+}
+
+# Render a bash array (nameref, arg1 = array name) whose elements are already
+# pre-rendered "{ ... }" JSON objects into a single "[ {..}, {..} ]" string.
+_json_array_of_objects() {
+  local -n arr="$1"
+  local n=${#arr[@]} i
+  if [[ ${n} -eq 0 ]]; then
+    printf '[]'
+    return
+  fi
+  printf '[\n'
+  for ((i = 0; i < n; i++)); do
+    printf '    %s' "${arr[$i]}"
+    [[ $i -lt $((n - 1)) ]] && printf ',\n' || printf '\n'
+  done
+  printf '  ]'
+}
+
+# Render a bash array (nameref, arg1 = array name) of plain strings into a
+# single "[ "a", "b" ]" JSON string array.
+_json_array_of_strings() {
+  local -n arr="$1"
+  local n=${#arr[@]} i
+  if [[ ${n} -eq 0 ]]; then
+    printf '[]'
+    return
+  fi
+  printf '[\n'
+  for ((i = 0; i < n; i++)); do
+    printf '    "%s"' "$(_json_escape "${arr[$i]}")"
+    [[ $i -lt $((n - 1)) ]] && printf ',\n' || printf '\n'
+  done
+  printf '  ]'
 }
 
 # Recognizability gate: refuse to write a garbage report against an
@@ -494,4 +562,113 @@ has_match() {  # $1 = glob pattern (already expanded by caller context)
   echo "| **Total** | ${total_count} | $(human_size "${total_bytes}") |"
 } > "${REPORT}"
 
+#################################################################################################
+# Write the machine-readable JSON report (same data as above, second emission pass)
+#################################################################################################
+
+TOPOLOGY_JSON=()
+for key in ${node_keys_sorted}; do
+  IFS=':' read -r sock node <<< "${key}"
+  TOPOLOGY_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_num "node" "${node}"), $(_json_str "type" "${NODE_TYPE[${key}]:-unknown}") }")
+done
+
+TESTS_RUN_JSON=()
+for sock in ${sockets_sorted}; do
+  if has_match "${DIR}"/idle_latency_*_numa_node_*.socket_${sock}.txt; then st="Done"; else st="Not run"; fi
+  TESTS_RUN_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_str "test" "Idle Latency"), $(_json_str "status" "${st}") }")
+
+  if has_match "${DIR}"/bw_node*.socket_${sock}.txt; then st="Done"; else st="Not run"; fi
+  TESTS_RUN_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_str "test" "Fixed-pattern Bandwidth"), $(_json_str "status" "${st}") }")
+
+  if has_match "${DIR}"/bw_ramp.results.*.socket_${sock}.csv; then st="Done"; else st="Not run"; fi
+  TESTS_RUN_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_str "test" "Bandwidth Ramp"), $(_json_str "status" "${st}") }")
+
+  if has_match "${DIR}"/bw_ramp_interleave.results.node_*.node_*.*.seq.*.socket_${sock}.csv; then st="Done"; else st="Not run"; fi
+  TESTS_RUN_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_str "test" "Interleave Ramp (seq)"), $(_json_str "status" "${st}") }")
+
+  if has_match "${DIR}"/bw_ramp_interleave.results.node_*.node_*.*.rand.*.socket_${sock}.csv; then
+    TESTS_RUN_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_str "test" "Interleave Ramp (rand)"), $(_json_str "status" "Known MLC limitation") }")
+  fi
+done
+
+PEAK_RESULTS_JSON=()
+for key in ${node_keys_sorted}; do
+  IFS=':' read -r sock node <<< "${key}"
+  IFS='|' read -r bw cores lat maxcores <<< "${PEAK_BW[${key}]:-}"
+  PEAK_RESULTS_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_num "node" "${node}"), $(_json_str "type" "${NODE_TYPE[${key}]:-unknown}"), $(_json_num "idle_lat_seq_ns" "${IDLE_SEQ[${key}]:-}"), $(_json_num "idle_lat_rand_ns" "${IDLE_RAND[${key}]:-}"), $(_json_num "peak_bw_mbs" "${bw:-}"), $(_json_num "at_cores" "${cores:-}"), $(_json_num "lat_at_peak_ns" "${lat:-}"), $(_json_num "max_cores_tested" "${maxcores:-}") }")
+done
+
+INTERLEAVE_JSON=()
+for key in ${ileave_keys_sorted}; do
+  IFS=':' read -r sock dnode cnode wtype <<< "${key}"
+  IFS='|' read -r bw cores lat ratio <<< "${ILEAVE_PEAK[${key}]:-}"
+  INTERLEAVE_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_num "dram_node" "${dnode}"), $(_json_num "cxl_node" "${cnode}"), $(_json_str "traffic" "${wtype}"), $(_json_num "peak_bw_mbs" "${bw:-}"), $(_json_num "at_cores" "${cores:-}"), $(_json_num "lat_at_peak_ns" "${lat:-}"), $(_json_str "best_ratio" "${ratio:-}") }")
+done
+
+# Same content as the "Observations / Potential Issues" Markdown section, flattened to strings.
+OBS_LINES=()
+for a in "${anomalies[@]:-}"; do
+  [[ -z "${a}" ]] && continue
+  OBS_LINES+=("${a}")
+done
+if [[ "${rand_interleave_present}" -eq 1 ]]; then
+  OBS_LINES+=("Interleave random-access (W21/W23/W27) data found with blank Latency/Bandwidth fields - this is a documented, permanent MLC restriction (random access is only supported for traffic types R, W2, W5, W6), not a failure. Current mlc.sh no longer attempts this combination.")
+fi
+for bf in "${unexplained_blank_files[@]:-}"; do
+  [[ -z "${bf}" ]] && continue
+  OBS_LINES+=("Result file with no usable data and no known limitation match: ${bf}")
+done
+for el in "${log_error_lines[@]:-}"; do
+  [[ -z "${el}" ]] && continue
+  OBS_LINES+=("Log error/warning line: ${el}")
+done
+if [[ -n "${log_missing_note}" ]]; then
+  OBS_LINES+=("${log_missing_note}")
+fi
+
+CHARTS_JSON=("${png_files[@]:-}")
+
+RAW_FILES_JSON=(
+  "{ $(_json_str "group" "idle_latency"), $(_json_num "count" "${idle_count}"), $(_json_num "total_bytes" "${idle_bytes}") }"
+  "{ $(_json_str "group" "fixed_pattern_bandwidth"), $(_json_num "count" "${bwtxt_count}"), $(_json_num "total_bytes" "${bwtxt_bytes}") }"
+  "{ $(_json_str "group" "bandwidth_ramp"), $(_json_num "count" "${ramp_count}"), $(_json_num "total_bytes" "${ramp_bytes}") }"
+  "{ $(_json_str "group" "interleave_ramp"), $(_json_num "count" "${ileave_count}"), $(_json_num "total_bytes" "${ileave_bytes}") }"
+  "{ $(_json_str "group" "charts"), $(_json_num "count" "${png_count}"), $(_json_num "total_bytes" "${png_bytes}") }"
+  "{ $(_json_str "group" "log"), $(_json_num "count" "${log_count}"), $(_json_num "total_bytes" "${log_bytes}") }"
+)
+if [[ "${other_count}" -gt 0 ]]; then
+  RAW_FILES_JSON+=("{ $(_json_str "group" "other"), $(_json_num "count" "${other_count}"), $(_json_num "total_bytes" "${other_bytes}") }")
+fi
+
+{
+  printf '{\n'
+  printf '  %s,\n' "$(_json_str "report_generated" "$(date -u '+%Y-%m-%d %H:%M:%S %Z')")"
+  printf '  %s,\n' "$(_json_str "source_directory" "${DIR}")"
+  printf '  %s,\n' "$(_json_str "run_status" "${run_status}")"
+  printf '  "system": {\n'
+  printf '    %s,\n' "$(_json_str "hostname" "${sut_hostname}")"
+  printf '    %s,\n' "$(_json_str "platform" "${sut_platform}")"
+  printf '    %s,\n' "$(_json_str "mlc_version" "${sut_mlc_ver}")"
+  printf '    %s,\n' "$(_json_str "mlc_sh_version" "${sut_mlc_sh_ver}")"
+  printf '    %s,\n' "$(_json_str "invocation" "${sut_invocation}")"
+  printf '    %s,\n' "$(_json_num "sockets_in_system" "${sut_sockets_in_system}")"
+  printf '    %s,\n' "$(_json_num "cores_per_socket" "${sut_cores_per_socket}")"
+  printf '    %s,\n' "$(_json_num "numa_nodes_in_system" "${sut_numa_nodes}")"
+  printf '    %s,\n' "$(_json_str "started" "${sut_started}")"
+  printf '    %s,\n' "$(_json_str "ended" "${sut_ended}")"
+  printf '    %s\n'  "$(_json_str "duration" "${sut_duration}")"
+  printf '  },\n'
+  printf '  "topology": %s,\n' "$(_json_array_of_objects TOPOLOGY_JSON)"
+  printf '  "tests_run": %s,\n' "$(_json_array_of_objects TESTS_RUN_JSON)"
+  printf '  "peak_results": %s,\n' "$(_json_array_of_objects PEAK_RESULTS_JSON)"
+  printf '  "interleave_peak_results": %s,\n' "$(_json_array_of_objects INTERLEAVE_JSON)"
+  printf '  "observations": %s,\n' "$(_json_array_of_strings OBS_LINES)"
+  printf '  "charts": %s,\n' "$(_json_array_of_strings CHARTS_JSON)"
+  printf '  "raw_files": %s,\n' "$(_json_array_of_objects RAW_FILES_JSON)"
+  printf '  %s,\n' "$(_json_num "total_files" "${total_count}")"
+  printf '  %s\n' "$(_json_num "total_bytes" "${total_bytes}")"
+  printf '}\n'
+} > "${REPORT_JSON}"
+
 echo "Report written to: ${REPORT}"
+echo "JSON report written to: ${REPORT_JSON}"

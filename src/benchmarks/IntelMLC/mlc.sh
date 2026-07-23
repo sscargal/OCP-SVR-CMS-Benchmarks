@@ -10,7 +10,7 @@ pushd $PWD &> /dev/null
 # Global Variables
 #################################################################################################
 
-VERSION="0.2.0"             # version string
+VERSION="0.3.0"             # version string
 
 SCRIPT_NAME=${0##*/}        # Name of this script
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}"; )" &> /dev/null && pwd 2> /dev/null; )"  # Provides the full directory name of the script no matter where it is being called from
@@ -174,6 +174,16 @@ function display_usage() {
    echo "        1: AVX_512 Option Enabled - Default"
    echo "      By default, the AVX_512 option is enabled. If the non-AVX512"
    echo "      version of MLC is being used, this option shall be set to 0"
+   echo " "
+   echo "Compare mode:"
+   echo " "
+   echo "   $0 --compare <run_A_dir_or_json> <run_B_dir_or_json> [-o <output.md>] [-t <threshold_pct>]"
+   echo "      Compare two prior mlc.sh output directories (or their"
+   echo "      summary_report.json files directly) and write a Markdown"
+   echo "      report highlighting which metrics got better or worse -"
+   echo "      useful for regression testing (run1 vs run2) or comparing"
+   echo "      one system to another. Needs neither root nor MLC itself."
+   echo "      See utils/gen_compare.py --help for all options."
    exit 0
 }
 
@@ -806,8 +816,21 @@ function cleanup() {
 
 
 #################################################################################################
-# Main 
+# Main
 #################################################################################################
+
+# --compare is a standalone mode: diff two prior mlc.sh output directories
+# (or their summary_report.json files directly) and write a comparison
+# report. It needs neither root nor the mlc binary, so it's handled here,
+# before argument parsing and the root check below.
+if [[ "${1:-}" == "--compare" ]]; then
+  shift
+  if [[ $# -lt 2 ]]; then
+    echo "Usage: $0 --compare <run_A_dir_or_json> <run_B_dir_or_json> [-o <output.md>] [-t <threshold_pct>]"
+    exit 1
+  fi
+  exec python3 "${SCRIPT_DIR}/utils/gen_compare.py" "$@"
+fi
 
 # Process the command line arguments
 process_args $@
