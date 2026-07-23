@@ -38,9 +38,16 @@ def read_csv_files(search_dir, regex_pattern=r'(.+)\.csv'):
 def generate_stacked_line_chart(data_dict, x_column, y_column, output_dir, image_name, title='Stacked Line Chart'):
     plt.figure(figsize=(10, 6))
 
+    plotted = False
     for filename, dataframe in data_dict.items():
         x = dataframe[x_column]
         y = dataframe[y_column]
+
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not finite.any():
+            print(f"Skipping '{filename}': no finite {y_column} data (all NaN/inf).")
+            continue
+        x, y = x[finite], y[finite]
 
         if len(x) >= 4 and x.is_monotonic_increasing and x.is_unique:
             # Perform cubic spline interpolation
@@ -53,6 +60,12 @@ def generate_stacked_line_chart(data_dict, x_column, y_column, output_dir, image
         cxl_ratio = dataframe['DRAM:CXL Ratio'].iloc[0]
         label = f"{node_label_from_filenames([filename])} {cxl_ratio}"
         plt.plot(x_new, y_smooth, label=label)
+        plotted = True
+
+    if not plotted:
+        print(f"Skipping chart '{image_name}': no series had finite {y_column} data.")
+        plt.close()
+        return
 
     plt.xlabel(x_column)
     plt.ylabel(y_column)
