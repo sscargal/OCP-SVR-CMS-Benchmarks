@@ -176,6 +176,13 @@ function display_usage() {
 # Process command arguments and options
 function process_args() {
 
+   # getopts has no concept of long options, so handle --help explicitly
+   for arg in "$@"; do
+     if [[ "$arg" == "--help" ]]; then
+       display_usage "$0"
+     fi
+   done
+
    # Process the command arguments and options
    while getopts "h?c:d:m:s:vXZ:" opt; do
       case "$opt" in
@@ -783,16 +790,19 @@ function cleanup() {
 # Main 
 #################################################################################################
 
+# Process the command line arguments
+process_args $@
+
 # Verify this script is executed as the root user
+# (checked after argument parsing so --help/-h/-? and validation errors
+# don't require root just to be displayed - root is only needed once we
+# actually start running privileged commands below)
 if [ "$EUID" -ne 0 ]
   then echo "Please run as root"
   exit
 fi
 
-# Process the command line arguments
-process_args $@
-
-# Verify the mandatory and optional tools and utilities are installed 
+# Verify the mandatory and optional tools and utilities are installed
 verify_cmds
 
 # Add the current working directory to $PATH
