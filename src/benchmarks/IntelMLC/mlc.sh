@@ -32,13 +32,14 @@ TAIL=("$(command -v tail)")         # Path to tail
 MLC=("$(command -v mlc)")           # Path to Intel MLC
 
 # Command line arguments
-socket=                       # -s argument to specify the CPU socket to run MLC, default OPT_DRAM_NUMA_NODE
+socket=                       # -s argument to specify the CPU socket to run MLC, default is the first DRAM (or CXL) node
 OPT_VERBOSITY=0               # default, -v, -vv, -vvv option to increase verbose output
 OPT_LOADED_LATENCY=false      # default, -l to override and perform loaded latency testing
 OPT_X=""                      # default, -X to override and use all cpu threads on all cores
 OPT_Z="-Z"                    # default, -Z to override and AVX-512 64-byte load/store instructions
-OPT_CXL_NUMA_NODE=-1          # default, -c to override and use the user specified NUMA Node backed by CXL
-OPT_DRAM_NUMA_NODE=-1         # default, -d to override and use the user specified NUMA Node backed by DRAM
+CXL_NODES=()                  # default empty, -c to specify one or more (comma-separated) NUMA Node(s) backed by CXL
+DRAM_NODES=()                 # default empty, -d to specify one or more (comma-separated) NUMA Node(s) backed by DRAM
+SOCKETS=()                    # default empty, -s to specify one or more (comma-separated) CPU socket(s)
 
 # MLC Options
 SAMPLE_TIME=30                # default, -t argument to MLC
@@ -129,26 +130,33 @@ function verify_cmds() {
 # Display the help information
 function display_usage() {
    echo " "
-   echo "Usage: $0 -c <CXL NUMA Node ID> -d <DRAM NUMA Node ID> [optional args]"
+   echo "Usage: $0 -c <CXL NUMA Node ID(s)> -d <DRAM NUMA Node ID(s)> [optional args]"
    echo " "
    echo "Runs bandwidth and latency tests on DRAM and CXL Type 3 Memory using Intel MLC"
    echo "Run with root privilege (MLC needs it)"
    echo " "
    echo "Optional args:"
    echo " "
-   echo "   -c <CXL NUMA Node>"
-   echo "      Required. Specify the NUMA Node backed by CXL for testing"
+   echo "   -c <CXL NUMA Node(s)>"
+   echo "      Specify the NUMA Node(s) backed by CXL for testing."
+   echo "      Accepts a single node or a comma-separated list, e.g. -c 2,3"
    echo " "
-   echo "   -d <DRAM NUMA Node>"
-   echo "      Required. Specify the NUMA Node backed by DRAM for testing"
+   echo "   -d <DRAM NUMA Node(s)>"
+   echo "      Specify the NUMA Node(s) backed by DRAM for testing."
+   echo "      Accepts a single node or a comma-separated list, e.g. -d 0,1"
+   echo " "
+   echo "      Providing both -c and -d sweeps every DRAM x CXL node pair"
+   echo "      for the interleave tests, in addition to per-node tests."
    echo " "
    echo "   -m <Path to MLC executable>"
    echo "      Specify the path to the MLC executable"
    echo " "
-   echo "   -s <Socket>"
-   echo "      Specify which CPU socket should be used for running mlc"
-   echo "      By default, CPU Socket 0 is used to run mlc"
-   echo " " 
+   echo "   -s <Socket(s)>"
+   echo "      Specify which CPU socket(s) should be used for running mlc."
+   echo "      Accepts a single socket or a comma-separated list, e.g. -s 0,1"
+   echo "      Each socket runs the full test sequence; output files are tagged with .socket_<n>."
+   echo "      By default, the first DRAM (or CXL) node id is used."
+   echo " "
    echo "   -v"
    echo "      Print verbose output. Use -v, -vv, and -vvv to increase verbosity."
    echo " "
@@ -174,34 +182,38 @@ function process_args() {
       h|\?)
         display_usage "$0"
         ;;
-      c) # Set the CXL NUMA Node ID to test
-        OPT_CXL_NUMA_NODE=$OPTARG
-        # Validate input is a numeric value
-        if ! [[ $OPT_CXL_NUMA_NODE =~ ^[0-9]+$ ]]
+      c) # Set the CXL NUMA Node ID(s) to test
+        # Validate input is a numeric value or comma-separated list of numeric values
+        if ! [[ $OPTARG =~ ^[0-9]+(,[0-9]+)*$ ]]
         then
-          echo "Error: Invalid value for '-c'. Requires an integer value."
+          echo "Error: Invalid value for '-c'. Requires an integer or comma-separated list of integers."
           exit 1
         fi
+        IFS=',' read -ra CXL_NODES <<< "$OPTARG"
         ;;
-      d) # Set the DRAM NUMA Node ID to test
-        OPT_DRAM_NUMA_NODE=$OPTARG
-        # Validate input is a numeric value
-        if ! [[ $OPT_DRAM_NUMA_NODE =~ ^[0-9]+$ ]]; then
-          echo "Error: Invalid value for '-d'. Requires an integer value."
+      d) # Set the DRAM NUMA Node ID(s) to test
+        # Validate input is a numeric value or comma-separated list of numeric values
+        if ! [[ $OPTARG =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+          echo "Error: Invalid value for '-d'. Requires an integer or comma-separated list of integers."
           exit 1
         fi
+        IFS=',' read -ra DRAM_NODES <<< "$OPTARG"
         ;;
       m) # Set the location of the mlc binary 
         MLC=$OPTARG
         ;;
-      s) # Specify which CPU socket to execute MLC on
-        socket=$OPTARG
-        # Validate input is a numeric value
-        if ! [[ $socket =~ ^[0-9]+$ ]]; then
-          echo "Error: Invalid value for '-s'. Requires an integer value."
+      s) # Specify which CPU socket(s) to execute MLC on
+        # Validate input is a numeric value or comma-separated list of numeric values
+        if ! [[ $OPTARG =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+          echo "Error: Invalid value for '-s'. Requires an integer or comma-separated list of integers."
           exit 1
         fi
-        verify_cpu_socket
+        IFS=',' read -ra SOCKETS <<< "$OPTARG"
+        # Validate every entry is a real socket on this system
+        for s in "${SOCKETS[@]}"; do
+          socket="$s"
+          verify_cpu_socket
+        done
          ;;
       v) # Each -v should increase OPT_VERBOSITY level
          OPT_VERBOSITY=$((OPT_VERBOSITY+1))
@@ -237,13 +249,13 @@ function process_args() {
    fi
 
    # Ensure the user provided one of -c or -d options
-   if [[ $OPT_CXL_NUMA_NODE -eq -1 ]] && [[ $OPT_DRAM_NUMA_NODE -eq -1 ]]; then
+   if [[ ${#CXL_NODES[@]} -eq 0 ]] && [[ ${#DRAM_NODES[@]} -eq 0 ]]; then
      echo "Error! You must provide either the '-c' or '-d' arguments with values"
      exit 1
    fi
 
-   if [ -z "$socket" ]; then
-     socket=$OPT_DRAM_NUMA_NODE
+   if [ ${#SOCKETS[@]} -eq 0 ]; then
+     SOCKETS=("${DRAM_NODES[0]:-${CXL_NODES[0]}}")
    fi
 }
 
@@ -291,7 +303,7 @@ function validate_config() {
 
   # if the -c option is specified, confirm the system has at least one CXL device.
   NUM_CXL_DEVICES=$(lspci | ${GREP} -c "CXL")
-  if [[ ${OPT_CXL_NUMA_NODE} -ge 0 ]] && [[ "${NUM_CXL_DEVICES}" -lt 1 ]]
+  if [[ ${#CXL_NODES[@]} -gt 0 ]] && [[ "${NUM_CXL_DEVICES}" -lt 1 ]]
   then
     echo "[Error] No CXL devices found! A minimum of one CXL device is required. Exiting"
     err_state=true
@@ -324,6 +336,29 @@ function verify_cpu_socket() {
       exit 1
    fi
 }
+
+# TODO: Auto-detect platform topology and run without requiring -s/-c/-d.
+#   Today the caller must already know and pass every CPU socket, DRAM NUMA
+#   node, and CXL NUMA node explicitly (this is why verify_numa_node() below
+#   can only range-check a node id, not classify it - see its TODO). A full
+#   auto-detect mode would need to:
+#     - Enumerate CPU sockets from `lscpu -e` / `lscpu | grep "Socket(s):"`
+#       (already partially done in get_cpu_socket_count) and populate
+#       SOCKETS with every socket found, instead of requiring -s.
+#     - Enumerate NUMA nodes from `numactl -H` / `lscpu -e=NODE` and classify
+#       each as DRAM- or CXL-backed, e.g. by cross-referencing `cxl list -M`
+#       (maps CXL memory devices/regions to their target NUMA node) and/or
+#       `daxctl list`, or heuristically flagging CPU-less memory-only nodes
+#       as CXL candidates - then populate DRAM_NODES/CXL_NODES automatically
+#       instead of requiring -d/-c.
+#     - Fall back to the current manual -s/-c/-d flags when detection is
+#       ambiguous or the required tooling (cxl/daxctl) isn't installed,
+#       rather than guessing wrong and mislabeling a node.
+#     - Print the discovered topology (sockets, DRAM nodes, CXL nodes) as
+#       part of the existing "Sweep plan" summary before running, so the
+#       user can confirm/abort before a potentially large auto-swept run.
+#   This would let mlc.sh be invoked with no topology args at all, e.g.
+#   `sudo ./mlc.sh --auto`, and sweep everything the platform actually has.
 
 # Verify the user supplied a DRAM/CXL NUMA node that is valid on this system
 # TODO: Check if the specified NUMA node is DRAM or CXL. For now, we just make sure the user input is within the range of NUMA nodes for this system
@@ -549,12 +584,12 @@ function idle_latency() {
    echo "Using CPU ${FIRST_CPU_ON_SOCKET}"
    echo "Using NUMA Node $1"
    echo -n "Idle sequential latency: "
-   ${MLC} --idle_latency -c"${FIRST_CPU_ON_SOCKET}" -j$1 ${OPT_X} > "$OUTPUT_PATH/idle_latency_seq_numa_node_$1.txt"
-   ${GREP} "Each iteration took" $OUTPUT_PATH/idle_latency_seq_numa_node_$1.txt
+   ${MLC} --idle_latency -c"${FIRST_CPU_ON_SOCKET}" -j$1 ${OPT_X} > "$OUTPUT_PATH/idle_latency_seq_numa_node_$1.socket_${socket}.txt"
+   ${GREP} "Each iteration took" $OUTPUT_PATH/idle_latency_seq_numa_node_$1.socket_${socket}.txt
 
    echo -n "Idle random latency: "
-   ${MLC} --idle_latency -c"${FIRST_CPU_ON_SOCKET}" -l256 -j"$1" -r ${OPT_X} > "$OUTPUT_PATH/idle_latency_rand_numa_node_$1.txt"
-   ${GREP} "Each iteration took" $OUTPUT_PATH/idle_latency_rand_numa_node_$1.txt
+   ${MLC} --idle_latency -c"${FIRST_CPU_ON_SOCKET}" -l256 -j"$1" -r ${OPT_X} > "$OUTPUT_PATH/idle_latency_rand_numa_node_$1.socket_${socket}.txt"
+   ${GREP} "Each iteration took" $OUTPUT_PATH/idle_latency_rand_numa_node_$1.socket_${socket}.txt
    echo "--- End ---"
 }
 
@@ -592,16 +627,16 @@ function bandwidth() {
    echo "Using Memory NUMA Node $1"
    BW_ARRAY=(
       #CPUs         Traffic type   seq or rand  buffer size   dram           dram node     output filename
-      "${CPU_RANGE} R              seq          $BUF_SZ       dram           $1            bw_node$1_seq_READ.txt"
-      "${CPU_RANGE} R              rand         $BUF_SZ       dram           $1            bw_node$1_rnd_READ.txt"
-      "${CPU_RANGE} W6             seq          $BUF_SZ       dram           $1            bw_node$1_seq_WRITE_NT.txt"
-      "${CPU_RANGE} W6             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_WRITE_NT.txt"
-      "${CPU_RANGE} W7             seq          $BUF_SZ       dram           $1            bw_node$1_seq_2READ_1WRITE_NT.txt"
-      "${CPU_RANGE} W7             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_2READ_1WRITE_NT.txt"
-      "${CPU_RANGE} W5             seq          $BUF_SZ       dram           $1            bw_node$1_seq_1READ_1WRITE.txt"
-      "${CPU_RANGE} W5             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_1READ_1WRITE.txt"
-      "${CPU_RANGE} W2             seq          $BUF_SZ       dram           $1            bw_node$1_seq_2READ_1WRITE.txt"
-      "${CPU_RANGE} W2             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_2READ_1WRITE.txt"
+      "${CPU_RANGE} R              seq          $BUF_SZ       dram           $1            bw_node$1_seq_READ.socket_${socket}.txt"
+      "${CPU_RANGE} R              rand         $BUF_SZ       dram           $1            bw_node$1_rnd_READ.socket_${socket}.txt"
+      "${CPU_RANGE} W6             seq          $BUF_SZ       dram           $1            bw_node$1_seq_WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W6             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W7             seq          $BUF_SZ       dram           $1            bw_node$1_seq_2READ_1WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W7             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_2READ_1WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W5             seq          $BUF_SZ       dram           $1            bw_node$1_seq_1READ_1WRITE.socket_${socket}.txt"
+      "${CPU_RANGE} W5             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_1READ_1WRITE.socket_${socket}.txt"
+      "${CPU_RANGE} W2             seq          $BUF_SZ       dram           $1            bw_node$1_seq_2READ_1WRITE.socket_${socket}.txt"
+      "${CPU_RANGE} W2             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_2READ_1WRITE.socket_${socket}.txt"
    )
   
    # Run a test for each entry in the BW_ARRAY
@@ -629,7 +664,14 @@ function bandwidth() {
 function bandwidth_ramp() {
   get_first_cpu_in_socket
   local MEM_NUMA_NODE=$1
-  if [[ ${OPT_DRAM_NUMA_NODE} -eq ${MEM_NUMA_NODE} ]]
+  local is_dram_node=false
+  for _n in "${DRAM_NODES[@]}"; do
+    if [[ "${_n}" -eq ${MEM_NUMA_NODE} ]]; then
+      is_dram_node=true
+      break
+    fi
+  done
+  if ${is_dram_node}
   then
     # Testing DRAM
     ratiostr="100:0"
@@ -639,8 +681,8 @@ function bandwidth_ramp() {
   fi
 
   # Output CSV file headings
-  local OutputCSVHeadings="Node,DRAM:CXL Ratio,NUMA Node Tested,Num of Cores,IO Pattern,Access Pattern,Latency(ns),Bandwidth(MB/s)"
-  
+  local OutputCSVHeadings="Socket,Node,DRAM:CXL Ratio,NUMA Node Tested,Num of Cores,IO Pattern,Access Pattern,Latency(ns),Bandwidth(MB/s)"
+
   echo "=== Collecting Memory Node ${MEM_NUMA_NODE} bandwidth using Socket ${socket} ==="
   for (( c=0; c<=${CORES_PER_SOCKET}-1; c=c+${IncCPU} ))
   do
@@ -658,12 +700,12 @@ function bandwidth_ramp() {
         # Print headings to the CSV file on first access
         if [[ ${c} -eq 0 ]]
         then
-          echo "${OutputCSVHeadings}" > "${OUTPUT_PATH}/bw_ramp.results.node_${MEM_NUMA_NODE}.${rdwr}.${access}.${ratiostr}.csv"
+          echo "${OutputCSVHeadings}" > "${OUTPUT_PATH}/bw_ramp.results.node_${MEM_NUMA_NODE}.${rdwr}.${access}.${ratiostr}.socket_${socket}.csv"
         fi
         # Extract the Latency and Bandwidth results from the log file
         LatencyResult=$(tail -n 4 "${LOG_FILE}" | ${GREP} '00000' | awk '{print $2}')
         BandwidthResult=$(tail -n 4 "${LOG_FILE}" | ${GREP} '00000' | awk '{print $3}')
-        echo "DRAM:CXL,\"${ratiostr}\",${MEM_NUMA_NODE},${c},${rdwr},${access},${LatencyResult},${BandwidthResult}" >> "${OUTPUT_PATH}/bw_ramp.results.node_${MEM_NUMA_NODE}.${rdwr}.${access}.${ratiostr}.csv"
+        echo "${socket},DRAM:CXL,\"${ratiostr}\",${MEM_NUMA_NODE},${c},${rdwr},${access},${LatencyResult},${BandwidthResult}" >> "${OUTPUT_PATH}/bw_ramp.results.node_${MEM_NUMA_NODE}.${rdwr}.${access}.${ratiostr}.socket_${socket}.csv"
       done
     done
   done
@@ -679,7 +721,7 @@ function bandwidth_ramp_interleave() {
   local ratiostr="0:0"
 
   # Output CSV file headings
-  local OutputCSVHeadings="Node,DRAM:CXL Ratio,Num of Cores,IO Pattern,Access Pattern,Latency(ns),Bandwidth(MB/s)"
+  local OutputCSVHeadings="Socket,Node,DRAM:CXL Ratio,Num of Cores,IO Pattern,Access Pattern,Latency(ns),Bandwidth(MB/s)"
 
   echo "=== Collecting DRAM + CXL interleaved stats using Socket ${socket} with Memory Nodes DRAM:${DRAM_NUMA_NODE}, CXL:${CXL_NUMA_NODE} ==="
   for (( c=0; c<=${CORES_PER_SOCKET}-1; c=c+${IncCPU} ))
@@ -695,8 +737,10 @@ function bandwidth_ramp_interleave() {
     # W27 : 2 reads and 1 non-temporal write (similar to –W7)
     for rdwr in W21 W23 W27 
     do
-      # Random bandwidth option is supported only for R, W2, W5 and W6 traffic types
-      for access in seq 
+      # Random bandwidth option may not be supported for all traffic types on all MLC versions;
+      # rows where MLC rejects the combination will have empty Latency/Bandwidth fields, which
+      # gen_plot.py skips gracefully.
+      for access in seq rand
       do
         for ratio in 10 25 50
         do 
@@ -709,7 +753,7 @@ function bandwidth_ramp_interleave() {
           # Print headings to the CSV file on first access
           if [[ ${c} -eq 0 ]]
           then
-            echo "${OutputCSVHeadings}" > "${OUTPUT_PATH}/bw_ramp_interleave.results.node_${DRAM_NUMA_NODE}.node_${CXL_NUMA_NODE}.${rdwr}.${access}.${ratio}.csv"
+            echo "${OutputCSVHeadings}" > "${OUTPUT_PATH}/bw_ramp_interleave.results.node_${DRAM_NUMA_NODE}.node_${CXL_NUMA_NODE}.${rdwr}.${access}.${ratio}.socket_${socket}.csv"
           fi
 
           # Generate the input file for MLC
@@ -722,7 +766,7 @@ function bandwidth_ramp_interleave() {
           LatencyResult=$(tail -n 4 "${LOG_FILE}" | ${GREP} '00000' | awk '{print $2}')
           BandwidthResult=$(tail -n 4 "${LOG_FILE}" | ${GREP} '00000' | awk '{print $3}')
           ratiostr="$(( 100 - ratio )):${ratio}"
-          echo "DRAM:CXL,\"${ratiostr}\",${c},${rdwr},${access},${LatencyResult},${BandwidthResult}" >> "${OUTPUT_PATH}/bw_ramp_interleave.results.node_${DRAM_NUMA_NODE}.node_${CXL_NUMA_NODE}.${rdwr}.${access}.${ratio}.csv"
+          echo "${socket},DRAM:CXL,\"${ratiostr}\",${c},${rdwr},${access},${LatencyResult},${BandwidthResult}" >> "${OUTPUT_PATH}/bw_ramp_interleave.results.node_${DRAM_NUMA_NODE}.node_${CXL_NUMA_NODE}.${rdwr}.${access}.${ratio}.socket_${socket}.csv"
         done 
       done
     done
@@ -766,7 +810,6 @@ display_start_info "$*"
 check_cpus
 get_cpu_socket_count
 get_cores_per_socket_count
-get_cpu_range_per_socket
 get_first_vcpu_per_socket
 check_hyperthreading_enabled
 validate_config
@@ -782,44 +825,65 @@ fi
 # Execute tests
 # TODO: Log the date/time when each test starts
 # TODO: Support a quiet mode that only displays the test and result, and excludes the "Thread id CXX, traffic pattern P, ..."
+if [[ ${#DRAM_NODES[@]} -gt 1 ]] || [[ ${#CXL_NODES[@]} -gt 1 ]] || [[ ${#SOCKETS[@]} -gt 1 ]]; then
+  echo "=== Sweep plan ==="
+  echo "Sockets    (${#SOCKETS[@]}): ${SOCKETS[*]}"
+  echo "DRAM nodes (${#DRAM_NODES[@]}): ${DRAM_NODES[*]}"
+  echo "CXL nodes  (${#CXL_NODES[@]}): ${CXL_NODES[*]}"
+  echo "Interleave pairs per socket: $(( ${#DRAM_NODES[@]} * ${#CXL_NODES[@]} ))"
+  echo "Interleave pairs total (all sockets): $(( ${#DRAM_NODES[@]} * ${#CXL_NODES[@]} * ${#SOCKETS[@]} ))"
+fi
+
 create_huge_pages
 
 # latency_matrix
-# Test idle_latency if -c or -d were provided
-if [[ $OPT_CXL_NUMA_NODE -ge 0 ]]; then
-  idle_latency "${OPT_CXL_NUMA_NODE}"
-fi
+# Run the full test sequence once per socket in the list.
+for socket in "${SOCKETS[@]}"; do
+  # Recompute CPU_RANGE for this socket (used by bandwidth())
+  get_cpu_range_per_socket
 
-if [[ $OPT_DRAM_NUMA_NODE -ge 0 ]]; then
-  idle_latency "${OPT_DRAM_NUMA_NODE}"
-fi
+  # Test idle_latency for every CXL and DRAM node provided
+  for node in "${CXL_NODES[@]}"; do
+    idle_latency "${node}"
+  done
 
-# Test bandwidth if -c or -d were provided
-if [[ $OPT_CXL_NUMA_NODE -ge 0 ]]; then
-  bandwidth "${OPT_CXL_NUMA_NODE}"
-fi
+  for node in "${DRAM_NODES[@]}"; do
+    idle_latency "${node}"
+  done
 
-if [[ $OPT_DRAM_NUMA_NODE -ge 0 ]]; then
-  bandwidth "${OPT_DRAM_NUMA_NODE}"
-fi
+  # Test bandwidth for every CXL and DRAM node provided
+  for node in "${CXL_NODES[@]}"; do
+    bandwidth "${node}"
+  done
 
-# Test bandwidth ramp up if -c or -d were provided
-if [[ $OPT_CXL_NUMA_NODE -ge 0 ]]; then
-  bandwidth_ramp "${OPT_CXL_NUMA_NODE}"
-fi
+  for node in "${DRAM_NODES[@]}"; do
+    bandwidth "${node}"
+  done
 
-if [[ $OPT_DRAM_NUMA_NODE -ge 0 ]]; then
-  bandwidth_ramp "${OPT_DRAM_NUMA_NODE}"
-fi
+  # Test bandwidth ramp up for every CXL and DRAM node provided
+  for node in "${CXL_NODES[@]}"; do
+    bandwidth_ramp "${node}"
+  done
 
-# If the user provided a DRAM and CXL node, test interleaving
-if [[ $OPT_CXL_NUMA_NODE -ge 0 ]] && [[ $OPT_DRAM_NUMA_NODE -ge 0 ]]; then
-  bandwidth_ramp_interleave "${OPT_DRAM_NUMA_NODE}" "${OPT_CXL_NUMA_NODE}"
-fi
+  for node in "${DRAM_NODES[@]}"; do
+    bandwidth_ramp "${node}"
+  done
+
+  # If the user provided both DRAM and CXL nodes, test interleaving for every DRAM x CXL pair
+  if [[ ${#CXL_NODES[@]} -gt 0 ]] && [[ ${#DRAM_NODES[@]} -gt 0 ]]; then
+    for d in "${DRAM_NODES[@]}"; do
+      for c in "${CXL_NODES[@]}"; do
+        bandwidth_ramp_interleave "${d}" "${c}"
+      done
+    done
+  fi
+done
 
 restore_huge_page_count
 
-# TODO: Generate charts using the CSV files
+echo ""
+echo "To generate charts from the CSV results, run:"
+echo "  ${SCRIPT_DIR}/utils/.venv/bin/python ${SCRIPT_DIR}/utils/gen_plot.py -d \"${OUTPUT_PATH}\""
 
 # TODO: Zip the output directory
 
