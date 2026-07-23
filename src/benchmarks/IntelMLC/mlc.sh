@@ -651,13 +651,6 @@ function bandwidth() {
       TOK=( $LN )
       echo ${TOK[0]} ${TOK[1]} ${TOK[2]} ${TOK[3]} ${TOK[4]} ${TOK[5]} > tmp_bw_testfile
       echo -n "Memory bandwidth for ${TOK[6]} (MiB/sec): "
-      if [ ${OPT_Z} == 1 ]; then
-        if [ ${TOK[1]} == "W7" ]; then
-          Z="-Z"
-        else
-          Z=""
-        fi
-      fi
       ${NUMACTL} -N ${socket} ${MLC} --loaded_latency -d0 -otmp_bw_testfile -t${SAMPLE_TIME} -T ${OPT_Z} ${OPT_X} > ${OUTPUT_PATH}/${TOK[6]}
       cat ${OUTPUT_PATH}/${TOK[6]} | ${SED} -n -e '/==========================/,$p' | tail -n+2 | ${AWK} '{print $3}'
       sleep 3
