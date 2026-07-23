@@ -92,6 +92,9 @@ function display_end_info() {
   print_time "${TEST_DURATION}" "Duration:"
   echo "Results: ${OUTPUT_PATH}"
   echo "Logfile: ${LOG_FILE}"
+  if [[ -f "${OUTPUT_PATH}/summary_report.md" ]]; then
+    echo "Report: ${OUTPUT_PATH}/summary_report.md"
+  fi
   echo "======================================================================="
 }
 
@@ -906,6 +909,11 @@ for socket in "${SOCKETS[@]}"; do
 done
 
 restore_huge_page_count
+
+# Generate the Markdown summary report (pure bash, no Python dependency).
+# Non-fatal - a report-generation problem should never abort a completed run.
+bash "${SCRIPT_DIR}/utils/gen_report.sh" "${OUTPUT_PATH}" || echo "WARNING: report generation failed"
+
 restore_output_ownership
 
 echo ""

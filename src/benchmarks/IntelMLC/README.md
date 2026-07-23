@@ -197,6 +197,7 @@ disambiguate results without needing a directory structure:
 | `bw_node<N>_{seq,rand}_<PATTERN>.socket_<S>.txt` | `bandwidth` | Peak bandwidth to node `<N>` from socket `<S>` for one of the 10 fixed traffic patterns |
 | `bw_ramp.results.node_<N>.R.{seq,rand}.<ratio>.socket_<S>.csv` | `bandwidth_ramp` | Bandwidth/latency vs. core count for node `<N>` from socket `<S>` (`<ratio>` is `100:0` if `<N>` was given via `-d`, `0:100` if via `-c`) |
 | `bw_ramp_interleave.results.node_<D>.node_<C>.<W>.seq.<ratio>.socket_<S>.csv` | `bandwidth_ramp_interleave` | Bandwidth/latency vs. core count for the DRAM node `<D>` + CXL node `<C>` pair from socket `<S>`, traffic type `<W>` (W21/W23/W27), at the given DRAM:CXL ratio. Seq only — MLC's interleave path rejects random access for W21/W23/W27 |
+| `summary_report.md` | `utils/gen_report.sh` | Auto-generated Markdown summary — system info, which tests ran/succeeded, peak latency/bandwidth tables by Socket→Node and by DRAM+CXL interleave pair, and auto-detected anomalies |
 
 The two CSV-producing functions (`bandwidth_ramp`, `bandwidth_ramp_interleave`)
 also write a `Socket` column (first column) into every row, so a CSV opened
@@ -207,16 +208,27 @@ filename itself, you never need per-socket or per-node subdirectories —
 point `gen_plot.py`/`gen_excel.py` at the one output directory and they'll
 find everything.
 
-At the end of a successful run, `mlc.sh` prints the exact command to
-generate charts, e.g.:
+At the end of a successful run, `mlc.sh` automatically generates
+`summary_report.md` (via `utils/gen_report.sh`, pure bash/awk — no Python
+venv needed, so unlike charts this one *does* run automatically) and prints
+its path, then prints the exact command to generate charts, e.g.:
 
 ```
+Report: ./mlc.sh.myhost.0723-1500/summary_report.md
+
 To generate charts from the CSV results, run:
   /path/to/IntelMLC/utils/.venv/bin/python /path/to/IntelMLC/utils/gen_plot.py -d "./mlc.sh.myhost.0723-1500"
 ```
 
-(It doesn't run this automatically, to avoid requiring a Python venv inside
-a root-privileged bash tool — see [Processing the results](#processing-the-results).)
+Charts aren't generated automatically, to avoid requiring a Python venv
+inside a root-privileged bash tool — see
+[Processing the results](#processing-the-results). `gen_report.sh` can also
+be re-run standalone at any time (e.g. after generating charts separately,
+to pick up the new PNGs into the report's Charts section):
+
+```bash
+$ utils/gen_report.sh ./mlc.sh.myhost.0723-1500
+```
 
 ## Processing the results
 
