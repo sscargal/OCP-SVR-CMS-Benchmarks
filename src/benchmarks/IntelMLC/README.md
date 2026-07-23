@@ -57,7 +57,14 @@ single node's bandwidth+ramp phase alone is several minutes).
 
 ## Requirements
 
-- Root privilege (MLC needs it; `mlc.sh` will refuse to run otherwise)
+- Root privilege (MLC needs it; `mlc.sh` will refuse to run otherwise). Run
+  it via `sudo ./mlc.sh ...` rather than as a logged-in root shell — at the
+  end of the run (or on Ctrl-C), `mlc.sh` hands ownership of the output
+  directory back to the invoking user (via `$SUDO_UID`/`$SUDO_USER`) so the
+  non-root post-processing steps below can read and write into it. If run
+  as literal root (no `sudo`, e.g. an `su -` shell) there's no non-root user
+  to hand ownership to, so it falls back to making the directory
+  world-readable/writable instead.
 - The `mlc` binary (see `get_mlc.sh`, or pass its path with `-m`)
 - At least 2 NUMA nodes on the system, and at least one CXL device present
   if you pass `-c`

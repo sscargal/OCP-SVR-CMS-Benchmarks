@@ -63,6 +63,7 @@ nr_hugepages=$(cat /proc/sys/vm/nr_hugepages)    # Number of Huge (2MiB) pages i
 trap ctrl_c INT
 function ctrl_c() {
   echo "INFO: Received CTRL+C - aborting"
+  restore_output_ownership
   display_end_info
   exit 1
 }
@@ -569,6 +570,26 @@ function restore_huge_page_count() {
   fi
 }
 
+# mlc.sh must run as root, so every file it writes ends up owned by root.
+# Post-processing (gen_plot.py/gen_excel.py) is documented to run without
+# root, so hand ownership of the output directory back to the invoking user
+# (available via $SUDO_UID/$SUDO_USER when run as 'sudo ./mlc.sh ...') so
+# they can read and write into it afterward.
+function restore_output_ownership() {
+  if [[ ! -d "${OUTPUT_PATH}" ]]; then
+    return
+  fi
+  if [[ -n "${SUDO_UID:-}" ]] && [[ -n "${SUDO_GID:-}" ]]; then
+    chown -R "${SUDO_UID}:${SUDO_GID}" "${OUTPUT_PATH}"
+  elif [[ -n "${SUDO_USER:-}" ]]; then
+    chown -R "${SUDO_USER}:${SUDO_USER}" "${OUTPUT_PATH}"
+  else
+    # Not invoked via sudo (e.g. logged in directly as root) - there's no
+    # non-root user to hand ownership to, so just make sure it's accessible.
+    chmod -R a+rwX "${OUTPUT_PATH}"
+  fi
+}
+
 #################################################################################################
 # Metric measuring functions
 #################################################################################################
@@ -885,6 +906,7 @@ for socket in "${SOCKETS[@]}"; do
 done
 
 restore_huge_page_count
+restore_output_ownership
 
 echo ""
 echo "To generate charts from the CSV results, run:"
