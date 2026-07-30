@@ -43,7 +43,22 @@ SOCKETS=()                    # default empty, -s to specify one or more (comma-
 
 # MLC Options
 SAMPLE_TIME=30                # default, -t argument to MLC
-BUF_SZ=40000                  # MLC Buffer Size
+
+# Buffer sizing (auto-tuned per platform - see compute_buf_sz_kb())
+# -------------------------------------------------------------------------
+# MLC allocates one buffer of this size *per thread* (see `mlc --help`'s "-o"
+# and "-u" - "-u" is what would change that). A buffer size tuned for an
+# older generation's small L3 becomes a cache-residency trap on modern CPUs:
+# at low core counts the *aggregate* footprint (buffer x active threads) can
+# fit entirely inside a modern multi-hundred-MB L3, so the test measures
+# cache bandwidth (2-3x faster than a single DDR5/CXL channel) instead of
+# real DRAM/CXL bandwidth. compute_buf_sz_kb() sizes the buffer per-run from
+# the actually-detected LLC size and the target NUMA node's free capacity
+# instead of a hardcoded constant. See README "Buffer sizing" section.
+CACHE_DEFEAT_MARGIN=${MLC_SH_CACHE_MARGIN:-3}                         # Buffer = this many x the detected LLC size, so even 1 active thread's own buffer exceeds it. Override: MLC_SH_CACHE_MARGIN
+NODE_CAPACITY_SAFE_FRACTION_PCT=${MLC_SH_CAPACITY_FRACTION_PCT:-75}   # Never let (buffer x max threads tested) exceed this % of a target node's free memory. Override: MLC_SH_CAPACITY_FRACTION_PCT
+BUF_SZ_LEGACY_DEFAULT=40000    # Fallback only - used if LLC auto-detection fails entirely (e.g. unsupported platform)
+OPT_BUF_SZ_OVERRIDE=""         # -b <KiB> forces an explicit buffer size and skips auto-detection/capping entirely
 
 # Global Variables
 NUMA_NODES_IN_SYSTEM=0        # Number of NUMA Nodes in the host
@@ -141,6 +156,15 @@ function display_usage() {
    echo " "
    echo "Optional args:"
    echo " "
+   echo "   -b <KiB>"
+   echo "      Force the MLC per-thread buffer size (KiB) instead of auto-detecting"
+   echo "      it from the target CPU's LLC size and the target NUMA node's free"
+   echo "      memory. Use this to override the auto-tuned value, e.g. to reproduce"
+   echo "      a prior run's exact buffer size, or if auto-detection is wrong for"
+   echo "      your platform. By default the buffer is sized to ${CACHE_DEFEAT_MARGIN}x the"
+   echo "      detected last-level cache so results are DRAM/CXL-bound rather than"
+   echo "      cache-resident, capped to ${NODE_CAPACITY_SAFE_FRACTION_PCT}% of the target node's free memory."
+   echo " "
    echo "   -c <CXL NUMA Node(s)>"
    echo "      Specify the NUMA Node(s) backed by CXL for testing."
    echo "      Accepts a single node or a comma-separated list, e.g. -c 2,3"
@@ -198,10 +222,17 @@ function process_args() {
    done
 
    # Process the command arguments and options
-   while getopts "h?c:d:m:s:vXZ:" opt; do
+   while getopts "h?b:c:d:m:s:vXZ:" opt; do
       case "$opt" in
       h|\?)
         display_usage "$0"
+        ;;
+      b) # Force an explicit per-thread buffer size (KiB), skipping auto-detection
+        if ! [[ $OPTARG =~ ^[0-9]+$ ]]; then
+          echo "Error: Invalid value for '-b'. Requires an integer (KiB)."
+          exit 1
+        fi
+        OPT_BUF_SZ_OVERRIDE=$OPTARG
         ;;
       c) # Set the CXL NUMA Node ID(s) to test
         # Validate input is a numeric value or comma-separated list of numeric values
@@ -604,6 +635,177 @@ function restore_output_ownership() {
 }
 
 #################################################################################################
+# Buffer sizing helpers (cache/capacity-aware)
+#################################################################################################
+
+# Count how many CPU IDs are covered by a range string like "0-95" or
+# "0-23,48-71" (comma-separated list of single IDs and/or dash-ranges).
+function count_cpus_in_range() {
+  local range="$1"
+  local total=0
+  local part start end
+  IFS=',' read -ra parts <<< "${range}"
+  for part in "${parts[@]}"; do
+    if [[ "${part}" == *-* ]]; then
+      start=${part%-*}
+      end=${part#*-}
+      total=$(( total + end - start + 1 ))
+    elif [[ -n "${part}" ]]; then
+      total=$(( total + 1 ))
+    fi
+  done
+  echo "${total}"
+}
+
+# Detect the size (KiB) of the last-level cache (LLC) for the socket that
+# CPU <cpu_id> belongs to.
+# Sets: LLC_SIZE_KB, LLC_LEVEL, LLC_SOURCE ("undetected" if nothing worked)
+function detect_llc_size_kb() {
+  local cpu_id="${1:-0}"
+  LLC_SIZE_KB=0
+  LLC_LEVEL=0
+  LLC_SOURCE="undetected"
+
+  # Preferred: `lscpu -C` (util-linux >= 2.37). ONE-SIZE is the size of a
+  # single cache instance (i.e. this socket's LLC) - ALL-SIZE would be the
+  # sum across every socket's instance, which is not what we want here.
+  if lscpu -C=NAME,ONE-SIZE,LEVEL -B &> /dev/null; then
+    local name size_b level
+    while read -r name size_b level; do
+      [[ "${level}" =~ ^[0-9]+$ ]] || continue
+      [[ "${size_b}" =~ ^[0-9]+$ ]] || continue
+      if (( level > LLC_LEVEL )) || { (( level == LLC_LEVEL )) && (( size_b / 1024 > LLC_SIZE_KB )); }; then
+        LLC_LEVEL=${level}
+        LLC_SIZE_KB=$(( size_b / 1024 ))
+        LLC_SOURCE="lscpu -C"
+      fi
+    done < <(lscpu -C=NAME,ONE-SIZE,LEVEL -B 2> /dev/null | tail -n +2)
+  fi
+
+  if (( LLC_SIZE_KB == 0 )); then
+    # Fallback for util-linux < 2.37 (no 'lscpu -C'): read cacheinfo directly
+    # from a CPU on the target socket. Linux reports the *total* size of a
+    # cache instance under every CPU that shares it, so reading cpu<cpu_id>
+    # gives that socket's real LLC size, not a per-CPU share of it.
+    local cache_dir level size_str size_kb
+    for cache_dir in /sys/devices/system/cpu/cpu${cpu_id}/cache/index*; do
+      [[ -d "${cache_dir}" ]] || continue
+      level=$(cat "${cache_dir}/level" 2> /dev/null)
+      size_str=$(cat "${cache_dir}/size" 2> /dev/null)
+      [[ -z "${level}" || -z "${size_str}" ]] && continue
+      size_kb=$(printf '%s' "${size_str}" | ${AWK} '
+        /K$/ { gsub(/K/,""); print $0+0; next }
+        /M$/ { gsub(/M/,""); print ($0+0)*1024; next }
+        /G$/ { gsub(/G/,""); print ($0+0)*1024*1024; next }
+        { print $0+0 }')
+      [[ -z "${size_kb}" ]] && continue
+      if (( level > LLC_LEVEL )) || { (( level == LLC_LEVEL )) && (( size_kb > LLC_SIZE_KB )); }; then
+        LLC_LEVEL=${level}
+        LLC_SIZE_KB=${size_kb}
+        LLC_SOURCE="/sys cacheinfo (cpu${cpu_id})"
+      fi
+    done
+  fi
+
+  if (( LLC_SIZE_KB > 0 )); then
+    echo "INFO: Detected L${LLC_LEVEL} (LLC) size: ${LLC_SIZE_KB} KiB ($(( LLC_SIZE_KB / 1024 )) MiB) via ${LLC_SOURCE}"
+  else
+    LLC_SOURCE="undetected"
+    echo "WARNING: Could not auto-detect LLC size on this platform. Falling back to the legacy default buffer size (${BUF_SZ_LEGACY_DEFAULT} KiB/thread) - low-core-count bandwidth results may include cache-residency effects. Use -b to force an explicit buffer size instead."
+  fi
+}
+
+# Detect free memory (KiB) on NUMA node <node_id> - the safety ceiling for
+# buffer sizing so a cache-defeating buffer never tries to allocate more
+# than the node under test actually has (e.g. a single small DRAM/CXL DIMM).
+# Sets: NODE_FREE_KB (0 if undetectable)
+function detect_node_capacity_kb() {
+  local node_id="$1"
+  NODE_FREE_KB=0
+  local meminfo="/sys/devices/system/node/node${node_id}/meminfo"
+  if [[ -r "${meminfo}" ]]; then
+    NODE_FREE_KB=$(${AWK} -v n="${node_id}" '$0 ~ ("Node "n" MemFree:") {print $4}' "${meminfo}")
+  fi
+  if [[ -z "${NODE_FREE_KB}" || "${NODE_FREE_KB}" -eq 0 ]]; then
+    # Fallback: parse `numactl -H`'s "node N free: X MB" line
+    NODE_FREE_KB=$(${NUMACTL} -H 2> /dev/null | ${AWK} -v n="node ${node_id} free:" 'tolower($0) ~ n {print $4*1024}')
+  fi
+  NODE_FREE_KB=${NODE_FREE_KB:-0}
+}
+
+# Compute the per-thread MLC buffer size (KiB) for a bandwidth test:
+# - Large enough that a single thread's own buffer already exceeds the
+#   target socket's LLC by CACHE_DEFEAT_MARGIN, so the ramp is memory-bound
+#   from the very first (1-thread) data point onward, not just at the tail.
+# - Capped so the *aggregate* footprint at the highest thread count this
+#   test will use (max_threads x buffer) never exceeds
+#   NODE_CAPACITY_SAFE_FRACTION_PCT of any involved NUMA node's free memory -
+#   critical for small pools (e.g. a single DIMM's worth of DRAM or CXL
+#   capacity), where a full cache-defeating buffer simply will not fit.
+# When the cap binds, low-core-count ramp points may retain some cache
+# residency; this prints a clear warning so that is never silent, and
+# gen_report.sh's sustained (tail-of-ramp) bandwidth column remains a valid
+# ground truth regardless of whether the cap engaged.
+# Usage: compute_buf_sz_kb <max_threads> <node_id> [<node_id2> ...]
+# Requires: detect_llc_size_kb has already been called for the target socket
+# Sets: BUF_SZ_KB, BUF_SZ_CAPPED (true/false)
+function compute_buf_sz_kb() {
+  local max_threads="$1"; shift
+  local nodes=("$@")
+
+  if [[ -n "${OPT_BUF_SZ_OVERRIDE}" ]]; then
+    BUF_SZ_KB=${OPT_BUF_SZ_OVERRIDE}
+    BUF_SZ_CAPPED=false
+    echo "INFO: Using user-specified buffer size (-b): ${BUF_SZ_KB} KiB/thread"
+    return
+  fi
+
+  local desired_kb
+  if [[ "${LLC_SOURCE}" != "undetected" ]] && (( LLC_SIZE_KB > 0 )); then
+    desired_kb=$(( LLC_SIZE_KB * CACHE_DEFEAT_MARGIN ))
+  else
+    desired_kb=${BUF_SZ_LEGACY_DEFAULT}
+  fi
+
+  local cap_kb=-1 node_cap n undetected_node=false
+  for n in "${nodes[@]}"; do
+    detect_node_capacity_kb "${n}"
+    if (( NODE_FREE_KB > 0 )); then
+      node_cap=$(( (NODE_FREE_KB * NODE_CAPACITY_SAFE_FRACTION_PCT / 100) / max_threads ))
+      if (( cap_kb == -1 )) || (( node_cap < cap_kb )); then
+        cap_kb=${node_cap}
+      fi
+    else
+      undetected_node=true
+    fi
+  done
+  if ${undetected_node}; then
+    echo "WARNING: Could not determine free memory for at least one target NUMA node (${nodes[*]}) - proceeding without a capacity cap from that node."
+  fi
+
+  BUF_SZ_KB=${desired_kb}
+  BUF_SZ_CAPPED=false
+  if (( cap_kb >= 0 )) && (( cap_kb < desired_kb )); then
+    BUF_SZ_KB=${cap_kb}
+    BUF_SZ_CAPPED=true
+  fi
+
+  # Round down to the nearest MiB for a clean number; never below 1 MiB/thread
+  # (a hard sanity floor, not a target - if capacity forces us this low,
+  # cache-defeat is effectively unachievable and the warning below says so).
+  BUF_SZ_KB=$(( (BUF_SZ_KB / 1024) * 1024 ))
+  if (( BUF_SZ_KB < 1024 )); then
+    BUF_SZ_KB=1024
+  fi
+
+  if ${BUF_SZ_CAPPED}; then
+    echo "WARNING: Buffer size capped to ${BUF_SZ_KB} KiB/thread ($(( BUF_SZ_KB / 1024 )) MiB) by target NUMA node capacity (node(s): ${nodes[*]}) - wanted ${desired_kb} KiB/thread ($(( desired_kb / 1024 )) MiB, ${CACHE_DEFEAT_MARGIN}x detected LLC) to fully defeat the L${LLC_LEVEL} cache (${LLC_SIZE_KB} KiB) at every core count tested. Low-core-count results for this test may retain partial cache residency - treat the sustained (max-core) bandwidth as ground truth."
+  else
+    echo "INFO: Buffer size: ${BUF_SZ_KB} KiB/thread ($(( BUF_SZ_KB / 1024 )) MiB) - ${CACHE_DEFEAT_MARGIN}x detected L${LLC_LEVEL} LLC (${LLC_SIZE_KB} KiB / $(( LLC_SIZE_KB / 1024 )) MiB) via ${LLC_SOURCE}"
+  fi
+}
+
+#################################################################################################
 # Metric measuring functions
 #################################################################################################
 
@@ -666,18 +868,20 @@ function bandwidth() {
    echo "--- Bandwidth Tests ---"
    echo "Using CPUs: ${CPU_RANGE}"
    echo "Using Memory NUMA Node $1"
+   detect_llc_size_kb "${FIRST_CPU_ON_SOCKET}"
+   compute_buf_sz_kb "$(count_cpus_in_range "${CPU_RANGE}")" "$1"
    BW_ARRAY=(
       #CPUs         Traffic type   seq or rand  buffer size   dram           dram node     output filename
-      "${CPU_RANGE} R              seq          $BUF_SZ       dram           $1            bw_node$1_seq_READ.socket_${socket}.txt"
-      "${CPU_RANGE} R              rand         $BUF_SZ       dram           $1            bw_node$1_rnd_READ.socket_${socket}.txt"
-      "${CPU_RANGE} W6             seq          $BUF_SZ       dram           $1            bw_node$1_seq_WRITE_NT.socket_${socket}.txt"
-      "${CPU_RANGE} W6             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_WRITE_NT.socket_${socket}.txt"
-      "${CPU_RANGE} W7             seq          $BUF_SZ       dram           $1            bw_node$1_seq_2READ_1WRITE_NT.socket_${socket}.txt"
-      "${CPU_RANGE} W7             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_2READ_1WRITE_NT.socket_${socket}.txt"
-      "${CPU_RANGE} W5             seq          $BUF_SZ       dram           $1            bw_node$1_seq_1READ_1WRITE.socket_${socket}.txt"
-      "${CPU_RANGE} W5             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_1READ_1WRITE.socket_${socket}.txt"
-      "${CPU_RANGE} W2             seq          $BUF_SZ       dram           $1            bw_node$1_seq_2READ_1WRITE.socket_${socket}.txt"
-      "${CPU_RANGE} W2             rand         $BUF_SZ       dram           $1            bw_node$1_rnd_2READ_1WRITE.socket_${socket}.txt"
+      "${CPU_RANGE} R              seq          $BUF_SZ_KB    dram           $1            bw_node$1_seq_READ.socket_${socket}.txt"
+      "${CPU_RANGE} R              rand         $BUF_SZ_KB    dram           $1            bw_node$1_rnd_READ.socket_${socket}.txt"
+      "${CPU_RANGE} W6             seq          $BUF_SZ_KB    dram           $1            bw_node$1_seq_WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W6             rand         $BUF_SZ_KB    dram           $1            bw_node$1_rnd_WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W7             seq          $BUF_SZ_KB    dram           $1            bw_node$1_seq_2READ_1WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W7             rand         $BUF_SZ_KB    dram           $1            bw_node$1_rnd_2READ_1WRITE_NT.socket_${socket}.txt"
+      "${CPU_RANGE} W5             seq          $BUF_SZ_KB    dram           $1            bw_node$1_seq_1READ_1WRITE.socket_${socket}.txt"
+      "${CPU_RANGE} W5             rand         $BUF_SZ_KB    dram           $1            bw_node$1_rnd_1READ_1WRITE.socket_${socket}.txt"
+      "${CPU_RANGE} W2             seq          $BUF_SZ_KB    dram           $1            bw_node$1_seq_2READ_1WRITE.socket_${socket}.txt"
+      "${CPU_RANGE} W2             rand         $BUF_SZ_KB    dram           $1            bw_node$1_rnd_2READ_1WRITE.socket_${socket}.txt"
    )
   
    # Run a test for each entry in the BW_ARRAY
@@ -717,6 +921,9 @@ function bandwidth_ramp() {
   # Output CSV file headings
   local OutputCSVHeadings="Socket,Node,DRAM:CXL Ratio,NUMA Node Tested,Num of Cores,IO Pattern,Access Pattern,Latency(ns),Bandwidth(MB/s)"
 
+  detect_llc_size_kb "${FIRST_CPU_ON_SOCKET}"
+  compute_buf_sz_kb "${CORES_PER_SOCKET}" "${MEM_NUMA_NODE}"
+
   echo "=== Collecting Memory Node ${MEM_NUMA_NODE} bandwidth using Socket ${socket} ==="
   for (( c=0; c<=${CORES_PER_SOCKET}-1; c=c+${IncCPU} ))
   do
@@ -727,7 +934,7 @@ function bandwidth_ramp() {
       # Random bandwidth option is supported only for R, W2, W5 and W6 traffic types
       for access in seq rand
       do
-        echo "${FIRST_CPU_ON_SOCKET}-${TO_CPU} ${rdwr} ${access} ${BUF_SZ} dram ${MEM_NUMA_NODE}" > mlc_loaded_latency.input
+        echo "${FIRST_CPU_ON_SOCKET}-${TO_CPU} ${rdwr} ${access} ${BUF_SZ_KB} dram ${MEM_NUMA_NODE}" > mlc_loaded_latency.input
         #numactl --membind=0 mlc/mlc --peak_injection_bandwidth -k1-${c}
         ${MLC} -i${FIRST_CPU_ON_SOCKET} --loaded_latency -gmlc_injection.delay -omlc_loaded_latency.input ${OPT_X}
         # Save the results to a CSV file
@@ -756,6 +963,14 @@ function bandwidth_ramp_interleave() {
 
   # Output CSV file headings
   local OutputCSVHeadings="Socket,Node,DRAM:CXL Ratio,Num of Cores,IO Pattern,Access Pattern,Latency(ns),Bandwidth(MB/s)"
+
+  detect_llc_size_kb "${FIRST_CPU_ON_SOCKET}"
+  # A single per-thread buffer is split across both nodes by ratio (10/25/50%),
+  # so either node could end up holding a large share of it depending on the
+  # ratio under test - size against both nodes' capacity, not just one, to
+  # keep the buffer size (and thus the methodology) identical across every
+  # ratio/traffic-type combination tested against this DRAM/CXL pair.
+  compute_buf_sz_kb "${CORES_PER_SOCKET}" "${DRAM_NUMA_NODE}" "${CXL_NUMA_NODE}"
 
   echo "=== Collecting DRAM + CXL interleaved stats using Socket ${socket} with Memory Nodes DRAM:${DRAM_NUMA_NODE}, CXL:${CXL_NUMA_NODE} ==="
   for (( c=0; c<=${CORES_PER_SOCKET}-1; c=c+${IncCPU} ))
@@ -793,10 +1008,10 @@ function bandwidth_ramp_interleave() {
           fi
 
           # Generate the input file for MLC
-          echo "${FIRST_CPU_ON_SOCKET}-${TO_CPU} ${rdwr} ${access} ${BUF_SZ} dram ${DRAM_NUMA_NODE} dram ${CXL_NUMA_NODE} ${ratio}" > mlc_loaded_latency.input
+          echo "${FIRST_CPU_ON_SOCKET}-${TO_CPU} ${rdwr} ${access} ${BUF_SZ_KB} dram ${DRAM_NUMA_NODE} dram ${CXL_NUMA_NODE} ${ratio}" > mlc_loaded_latency.input
 
           # Run MLC
-          ${MLC} -i${FIRST_CPU_ON_SOCKET} --loaded_latency -gmlc_injection.delay -omlc_loaded_latency.input
+          ${MLC} -i${FIRST_CPU_ON_SOCKET} --loaded_latency -gmlc_injection.delay -omlc_loaded_latency.input ${OPT_X}
 
           # Extract the Latency and Bandwidth results
           LatencyResult=$(tail -n 4 "${LOG_FILE}" | ${GREP} '00000' | awk '{print $2}')

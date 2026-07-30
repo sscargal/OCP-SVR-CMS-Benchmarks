@@ -15,16 +15,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # (json key, column label, "higher"|"lower" is better)
+# Peak BW/Best Ratio can still reflect a low-core-count cache-residency
+# artifact (see summary_report.md's Observations section); Sustained BW is
+# the tail-of-ramp value and is the one to trust for real regressions -
+# both are compared here so a report generated before this field existed
+# (sustained_bw_mbs absent -> None -> rendered as "n/a", no crash) still
+# compares cleanly against a newer one.
 PEAK_METRICS = [
     ("idle_lat_seq_ns", "Idle Lat seq (ns)", "lower"),
     ("idle_lat_rand_ns", "Idle Lat rand (ns)", "lower"),
     ("peak_bw_mbs", "Peak BW (MB/s)", "higher"),
     ("lat_at_peak_ns", "Lat @ Peak (ns)", "lower"),
+    ("sustained_bw_mbs", "Sustained BW (MB/s)", "higher"),
 ]
 
 INTERLEAVE_METRICS = [
     ("peak_bw_mbs", "Peak BW (MB/s)", "higher"),
     ("lat_at_peak_ns", "Lat @ Peak (ns)", "lower"),
+    ("sustained_bw_mbs", "Sustained BW (MB/s)", "higher"),
 ]
 
 SYSTEM_FIELDS = [
@@ -179,6 +187,7 @@ def build_interleave_table(matched, idx_a, idx_b, threshold):
     header = ["Socket", "DRAM Node", "CXL Node", "Traffic"] + [m[1] for m in INTERLEAVE_METRICS] + [
         "@ Cores (A/B)",
         "Best Ratio (A/B)",
+        "Sustained Ratio (A/B)",
     ]
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|" + "|".join(["---"] * len(header)) + "|")
@@ -190,6 +199,7 @@ def build_interleave_table(matched, idx_a, idx_b, threshold):
             cells.append(metric_cell(row_a.get(mkey), row_b.get(mkey), direction, threshold))
         cells.append(f"{fmt(row_a.get('at_cores'))}/{fmt(row_b.get('at_cores'))}")
         cells.append(f"{row_a.get('best_ratio', 'n/a')}/{row_b.get('best_ratio', 'n/a')}")
+        cells.append(f"{row_a.get('sustained_ratio', 'n/a')}/{row_b.get('sustained_ratio', 'n/a')}")
         lines.append("| " + " | ".join(cells) + " |")
     return lines
 

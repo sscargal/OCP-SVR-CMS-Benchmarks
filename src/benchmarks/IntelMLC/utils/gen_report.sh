@@ -196,10 +196,11 @@ fi
 # Topology discovery + peak bandwidth/latency per (socket, node)
 #################################################################################################
 
-declare -A NODE_TYPE   # NODE_TYPE[socket:node] = DRAM|CXL|unknown
-declare -A IDLE_SEQ    # IDLE_SEQ[socket:node]  = ns
-declare -A IDLE_RAND   # IDLE_RAND[socket:node] = ns
-declare -A PEAK_BW     # PEAK_BW[socket:node]   = "bw|cores|lat|maxcores"
+declare -A NODE_TYPE      # NODE_TYPE[socket:node] = DRAM|CXL|unknown
+declare -A IDLE_SEQ       # IDLE_SEQ[socket:node]  = ns
+declare -A IDLE_RAND      # IDLE_RAND[socket:node] = ns
+declare -A PEAK_BW        # PEAK_BW[socket:node]   = "bw|cores|lat|maxcores" (ramp-wide max - may still be a cache-residency artifact if the buffer-size cap engaged, see SUSTAINED_BW/observations)
+declare -A SUSTAINED_BW   # SUSTAINED_BW[socket:node] = "bw|cores" (bandwidth at the highest core count tested - the tail-of-ramp value, unaffected by any early cache-residency)
 
 for f in "${DIR}"/bw_ramp.results.node_*.R.seq.*.socket_*.csv; do
   [[ -e "${f}" ]] || continue
@@ -222,6 +223,14 @@ for f in "${DIR}"/bw_ramp.results.node_*.R.seq.*.socket_*.csv; do
     }
     END { if (mb>0) printf "%.1f|%s|%s|%s", mb, c, l, last }' "${f}")
 
+  # Tail-of-ramp: the bandwidth at the highest core count tested (rows are
+  # written in increasing core-count order by bandwidth_ramp()). This is
+  # never a cache-residency artifact - by the max core count, the aggregate
+  # working set is at its largest, so if anything is going to spill out of
+  # cache it already has. Ground truth for DRAM/CXL comparisons even when
+  # PEAK_BW above was measured at a low, possibly cache-resident, core count.
+  SUSTAINED_BW[${key}]=$(awk -F, 'NR>1 && $9!="" { bw=$9+0; cores=$5 } END { if (cores!="") printf "%.1f|%s", bw, cores }' "${f}")
+
   idle_seq_file="${DIR}/idle_latency_seq_numa_node_${node}.socket_${sock}.txt"
   idle_rand_file="${DIR}/idle_latency_rand_numa_node_${node}.socket_${sock}.txt"
   [[ -f "${idle_seq_file}" ]] && IDLE_SEQ[${key}]=$(awk '/Each iteration took/{print $(NF-1); exit}' "${idle_seq_file}")
@@ -234,7 +243,8 @@ node_keys_sorted=$(printf '%s\n' "${!PEAK_BW[@]}" | sort -t: -k1,1n -k2,2n)
 # Interleave pair discovery + peak bandwidth/latency (seq only)
 #################################################################################################
 
-declare -A ILEAVE_PEAK  # ILEAVE_PEAK[socket:dnode:cnode:wtype] = "bw|cores|lat|ratio"
+declare -A ILEAVE_PEAK       # ILEAVE_PEAK[socket:dnode:cnode:wtype]      = "bw|cores|lat|ratio" (ramp-wide max across all ratios - may still be a cache-residency artifact, see ILEAVE_SUSTAINED)
+declare -A ILEAVE_SUSTAINED  # ILEAVE_SUSTAINED[socket:dnode:cnode:wtype] = "bw|cores|lat|ratio" (best tail-of-ramp bandwidth across all ratios - ground truth)
 declare -A ILEAVE_SEEN
 ileave_keys=()
 
@@ -267,6 +277,22 @@ for key in ${ileave_keys_sorted}; do
       if (v>mb) { mb=v; c=$4; l=$7; r=$3 }
     }
     END { if (mb>0) printf "%.1f|%s|%s|%s", mb, c, l, r }' "${files[@]}")
+
+  # Tail-of-ramp per ratio, then best across ratios: each file (one per
+  # ratio) has its rows in increasing core-count order, so its *last* row is
+  # that ratio's steady-state value. FNR==1 marks the start of a new file -
+  # at that point the previously-buffered row was the prior file's last row,
+  # so compare it then; the END block handles the final file the same way.
+  ILEAVE_SUSTAINED[${key}]=$(awk -F, '
+      FNR==1 {
+        if (NR>1 && prev_bw!="") { if (prev_bw+0>mb) { mb=prev_bw+0; c=prev_c; l=prev_l; r=prev_r } }
+        next
+      }
+      $8!="" { gsub(/"/,"",$3); prev_bw=$8; prev_c=$4; prev_l=$7; prev_r=$3 }
+      END {
+        if (prev_bw!="") { if (prev_bw+0>mb) { mb=prev_bw+0; c=prev_c; l=prev_l; r=prev_r } }
+        if (mb>0) printf "%.1f|%s|%s|%s", mb, c, l, r
+      }' "${files[@]}")
 done
 
 # Known MLC limitation: interleave rand files (from pre-fix mlc.sh runs) can
@@ -298,24 +324,42 @@ fi
 
 #################################################################################################
 # Anomaly detection: bandwidth that peaks early then declines >20% by the
-# highest core count tested (e.g. CXL link saturation/back-pressure).
+# highest core count tested. This pattern is the signature of a
+# cache-residency artifact, not a genuine memory-tier saturation effect: at
+# low core counts the aggregate working set (buffer size x active threads)
+# can still fit inside a modern multi-hundred-MB LLC, so the measurement is
+# cache bandwidth (several x faster than a single DRAM/CXL channel) rather
+# than real DRAM/CXL bandwidth. mlc.sh sizes its buffer to avoid this (see
+# compute_buf_sz_kb() in mlc.sh), but a small target NUMA node's capacity can
+# still force a smaller buffer than ideal - if that happened, the run log
+# contains a "Buffer size capped" warning (surfaced separately below).
 #################################################################################################
 
 anomalies=()
 for key in ${node_keys_sorted}; do
   IFS='|' read -r bw cores lat maxcores <<< "${PEAK_BW[${key}]:-}"
   [[ -z "${bw:-}" ]] && continue
+  IFS='|' read -r tail_bw tail_cores <<< "${SUSTAINED_BW[${key}]:-}"
+  [[ -z "${tail_bw:-}" ]] && continue
   IFS=':' read -r sock node <<< "${key}"
-  f=$(ls "${DIR}"/bw_ramp.results.node_${node}.R.seq.*.socket_${sock}.csv 2>/dev/null | head -1)
-  [[ -z "${f}" ]] && continue
-  tail_bw=$(awk -F, -v mc="${maxcores}" 'NR>1 && $5==mc && $9!="" {print $9+0; exit}' "${f}")
-  if [[ -n "${tail_bw:-}" ]]; then
-    drop_pct=$(awk -v peak="${bw}" -v tail="${tail_bw}" 'BEGIN { if (peak>0) printf "%.0f", ((peak-tail)/peak)*100; else print 0 }')
-    if [[ "${drop_pct}" -gt 20 ]]; then
-      anomalies+=("Socket ${sock} -> Node ${node} (${NODE_TYPE[${key}]:-unknown}) bandwidth peaks at ${cores} of ${maxcores} cores tested (${bw} MB/s) then declines ${drop_pct}% to ${tail_bw} MB/s by ${maxcores} cores - possible bandwidth saturation/back-pressure.")
-    fi
+  drop_pct=$(awk -v peak="${bw}" -v tail="${tail_bw}" 'BEGIN { if (peak>0) printf "%.0f", ((peak-tail)/peak)*100; else print 0 }')
+  if [[ "${drop_pct}" -gt 20 ]]; then
+    anomalies+=("Socket ${sock} -> Node ${node} (${NODE_TYPE[${key}]:-unknown}) bandwidth peaks at ${cores} of ${maxcores} cores tested (${bw} MB/s) then drops ${drop_pct}% to ${tail_bw} MB/s by ${maxcores} cores - almost certainly a cache-residency artifact at the low core count, not a genuine memory-tier bandwidth peak. Treat the Sustained BW (${tail_bw} MB/s @ ${tail_cores} cores) as ground truth for this node, not Peak BW.")
   fi
 done
+
+#################################################################################################
+# Buffer-size-capped warnings: mlc.sh's compute_buf_sz_kb() prints one of
+# these whenever a target NUMA node's free capacity was too small to fit a
+# fully cache-defeating buffer, so the low-core-count region of that
+# particular test may still contain some cache-residency effect. Surface
+# them explicitly in Observations rather than leaving them buried in the log.
+#################################################################################################
+
+buf_capped_lines=()
+if [[ -f "${LOG}" ]]; then
+  mapfile -t buf_capped_lines < <(grep '^WARNING: Buffer size capped' "${LOG}" | sort -u)
+fi
 
 #################################################################################################
 # Charts
@@ -473,24 +517,39 @@ has_match() {  # $1 = glob pattern (already expanded by caller context)
 
   echo "## Peak Results by Socket -> Node"
   echo
-  echo "| Socket | Node | Type | Idle Lat seq (ns) | Idle Lat rand (ns) | Peak BW (MB/s) | @ Cores | Lat @ Peak (ns) | Max Cores Tested |"
-  echo "|--------|------|------|--------------------|---------------------|----------------|---------|------------------|-------------------|"
+  echo "Peak BW is the highest bandwidth seen anywhere in the core-count ramp -"
+  echo "at low core counts this can still be a cache-residency artifact (see"
+  echo "Observations below) rather than real DRAM/CXL bandwidth. **Sustained BW**"
+  echo "is the bandwidth at the highest core count tested, which is never"
+  echo "cache-resident - treat it as ground truth for DRAM/CXL comparisons."
+  echo
+  echo "| Socket | Node | Type | Idle Lat seq (ns) | Idle Lat rand (ns) | Peak BW (MB/s) | @ Cores | Lat @ Peak (ns) | Sustained BW (MB/s) | Max Cores Tested |"
+  echo "|--------|------|------|--------------------|---------------------|----------------|---------|------------------|----------------------|-------------------|"
   for key in ${node_keys_sorted}; do
     IFS=':' read -r sock node <<< "${key}"
     IFS='|' read -r bw cores lat maxcores <<< "${PEAK_BW[${key}]:-}"
-    echo "| ${sock} | ${node} | ${NODE_TYPE[${key}]:-unknown} | ${IDLE_SEQ[${key}]:-n/a} | ${IDLE_RAND[${key}]:-n/a} | ${bw:-no data} | ${cores:-} | ${lat:-} | ${maxcores:-} |"
+    IFS='|' read -r sustained_bw sustained_cores <<< "${SUSTAINED_BW[${key}]:-}"
+    echo "| ${sock} | ${node} | ${NODE_TYPE[${key}]:-unknown} | ${IDLE_SEQ[${key}]:-n/a} | ${IDLE_RAND[${key}]:-n/a} | ${bw:-no data} | ${cores:-} | ${lat:-} | ${sustained_bw:-no data} | ${maxcores:-} |"
   done
   echo
 
   if [[ -n "${ileave_keys_sorted}" ]]; then
     echo "## Interleave Peak Results (DRAM + CXL, seq)"
     echo
-    echo "| Socket | DRAM Node | CXL Node | Traffic | Peak BW (MB/s) | @ Cores | Lat @ Peak (ns) | Best Ratio (DRAM:CXL) |"
-    echo "|--------|-----------|----------|---------|----------------|---------|------------------|------------------------|"
+    echo "Peak BW/Best Ratio are the highest bandwidth seen anywhere across every"
+    echo "ratio's core-count ramp - at low core counts this can still be a"
+    echo "cache-residency artifact rather than a genuine DRAM:CXL tiering result."
+    echo "**Sustained BW/Ratio** picks the best *tail-of-ramp* (highest core count)"
+    echo "value across ratios instead - never cache-resident, so this is the"
+    echo "number to trust when deciding which ratio genuinely performs best."
+    echo
+    echo "| Socket | DRAM Node | CXL Node | Traffic | Peak BW (MB/s) | @ Cores | Lat @ Peak (ns) | Best Ratio (DRAM:CXL) | Sustained BW (MB/s) | Sustained Ratio (DRAM:CXL) |"
+    echo "|--------|-----------|----------|---------|----------------|---------|------------------|------------------------|----------------------|------------------------------|"
     for key in ${ileave_keys_sorted}; do
       IFS=':' read -r sock dnode cnode wtype <<< "${key}"
       IFS='|' read -r bw cores lat ratio <<< "${ILEAVE_PEAK[${key}]:-}"
-      echo "| ${sock} | ${dnode} | ${cnode} | ${wtype} | ${bw:-no data} | ${cores:-} | ${lat:-} | ${ratio:-} |"
+      IFS='|' read -r sustained_bw sustained_cores sustained_lat sustained_ratio <<< "${ILEAVE_SUSTAINED[${key}]:-}"
+      echo "| ${sock} | ${dnode} | ${cnode} | ${wtype} | ${bw:-no data} | ${cores:-} | ${lat:-} | ${ratio:-} | ${sustained_bw:-no data} | ${sustained_ratio:-} |"
     done
     echo
   fi
@@ -505,6 +564,13 @@ has_match() {  # $1 = glob pattern (already expanded by caller context)
   done
   if [[ "${rand_interleave_present}" -eq 1 ]]; then
     echo "- Interleave random-access (W21/W23/W27) data found with blank Latency/Bandwidth fields - this is a documented, permanent MLC restriction (random access is only supported for traffic types R, W2, W5, W6), not a failure. Current mlc.sh no longer attempts this combination."
+    obs_any=1
+  fi
+  if [[ "${#buf_capped_lines[@]}" -gt 0 ]]; then
+    echo "- Buffer size was capped below the cache-defeating target by target NUMA node capacity for ${#buf_capped_lines[@]} test(s) - some low-core-count results below may retain partial cache residency. Trust the Sustained BW/Ratio columns above over Peak BW/Best Ratio for these:"
+    for bl in "${buf_capped_lines[@]}"; do
+      echo "  - ${bl#WARNING: }"
+    done
     obs_any=1
   fi
   if [[ "${#unexplained_blank_files[@]}" -gt 0 ]]; then
@@ -595,14 +661,16 @@ PEAK_RESULTS_JSON=()
 for key in ${node_keys_sorted}; do
   IFS=':' read -r sock node <<< "${key}"
   IFS='|' read -r bw cores lat maxcores <<< "${PEAK_BW[${key}]:-}"
-  PEAK_RESULTS_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_num "node" "${node}"), $(_json_str "type" "${NODE_TYPE[${key}]:-unknown}"), $(_json_num "idle_lat_seq_ns" "${IDLE_SEQ[${key}]:-}"), $(_json_num "idle_lat_rand_ns" "${IDLE_RAND[${key}]:-}"), $(_json_num "peak_bw_mbs" "${bw:-}"), $(_json_num "at_cores" "${cores:-}"), $(_json_num "lat_at_peak_ns" "${lat:-}"), $(_json_num "max_cores_tested" "${maxcores:-}") }")
+  IFS='|' read -r sustained_bw sustained_cores <<< "${SUSTAINED_BW[${key}]:-}"
+  PEAK_RESULTS_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_num "node" "${node}"), $(_json_str "type" "${NODE_TYPE[${key}]:-unknown}"), $(_json_num "idle_lat_seq_ns" "${IDLE_SEQ[${key}]:-}"), $(_json_num "idle_lat_rand_ns" "${IDLE_RAND[${key}]:-}"), $(_json_num "peak_bw_mbs" "${bw:-}"), $(_json_num "at_cores" "${cores:-}"), $(_json_num "lat_at_peak_ns" "${lat:-}"), $(_json_num "sustained_bw_mbs" "${sustained_bw:-}"), $(_json_num "max_cores_tested" "${maxcores:-}") }")
 done
 
 INTERLEAVE_JSON=()
 for key in ${ileave_keys_sorted}; do
   IFS=':' read -r sock dnode cnode wtype <<< "${key}"
   IFS='|' read -r bw cores lat ratio <<< "${ILEAVE_PEAK[${key}]:-}"
-  INTERLEAVE_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_num "dram_node" "${dnode}"), $(_json_num "cxl_node" "${cnode}"), $(_json_str "traffic" "${wtype}"), $(_json_num "peak_bw_mbs" "${bw:-}"), $(_json_num "at_cores" "${cores:-}"), $(_json_num "lat_at_peak_ns" "${lat:-}"), $(_json_str "best_ratio" "${ratio:-}") }")
+  IFS='|' read -r sustained_bw sustained_cores sustained_lat sustained_ratio <<< "${ILEAVE_SUSTAINED[${key}]:-}"
+  INTERLEAVE_JSON+=("{ $(_json_num "socket" "${sock}"), $(_json_num "dram_node" "${dnode}"), $(_json_num "cxl_node" "${cnode}"), $(_json_str "traffic" "${wtype}"), $(_json_num "peak_bw_mbs" "${bw:-}"), $(_json_num "at_cores" "${cores:-}"), $(_json_num "lat_at_peak_ns" "${lat:-}"), $(_json_str "best_ratio" "${ratio:-}"), $(_json_num "sustained_bw_mbs" "${sustained_bw:-}"), $(_json_str "sustained_ratio" "${sustained_ratio:-}") }")
 done
 
 # Same content as the "Observations / Potential Issues" Markdown section, flattened to strings.
@@ -614,6 +682,10 @@ done
 if [[ "${rand_interleave_present}" -eq 1 ]]; then
   OBS_LINES+=("Interleave random-access (W21/W23/W27) data found with blank Latency/Bandwidth fields - this is a documented, permanent MLC restriction (random access is only supported for traffic types R, W2, W5, W6), not a failure. Current mlc.sh no longer attempts this combination.")
 fi
+for bl in "${buf_capped_lines[@]:-}"; do
+  [[ -z "${bl}" ]] && continue
+  OBS_LINES+=("${bl#WARNING: }")
+done
 for bf in "${unexplained_blank_files[@]:-}"; do
   [[ -z "${bf}" ]] && continue
   OBS_LINES+=("Result file with no usable data and no known limitation match: ${bf}")

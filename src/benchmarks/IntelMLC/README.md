@@ -53,7 +53,56 @@ Before starting tests, if `-s`, `-c`, or `-d` was given more than one value,
 interleave pair counts, per-socket and total) so you know the scope before
 it runs — **runtime scales with the product of sockets × DRAM nodes × CXL
 nodes**: a 2×2×2 sweep runs roughly 8× a single-socket/single-node run (each
-single node's bandwidth+ramp phase alone is several minutes).
+single node's bandwidth+ramp phase alone is several minutes, and can be
+substantially longer now that buffer sizes are tuned to defeat modern
+multi-hundred-MB LLCs - see below).
+
+## Buffer sizing
+
+`mlc.sh` allocates one memory buffer per MLC thread for every bandwidth test
+(`bandwidth()`, `bandwidth_ramp()`, `bandwidth_ramp_interleave()`). Older
+generations of this script hardcoded that buffer to a small, fixed size
+(40 MiB/thread). Server L3 caches have grown enormously since - hundreds of
+MB, shared across every core on a socket - so a small fixed buffer means the
+*aggregate* footprint (buffer × active threads) can fit entirely inside the
+LLC at low core counts. When that happens, the "bandwidth" MLC reports is
+cache bandwidth (several × faster than a single DRAM/CXL channel), not real
+memory-tier bandwidth - the low-core-count region of the ramp silently stops
+measuring what it claims to measure.
+
+To fix this, `mlc.sh` now auto-detects, at the start of each test:
+
+1. **The target socket's last-level cache size** - via `lscpu -C` (util-linux
+   ≥ 2.37) with a `/sys/devices/system/cpu/cpuN/cache/` fallback for older
+   systems. The buffer is sized to `CACHE_DEFEAT_MARGIN` (default `3`) ×
+   that LLC size, so even a *single* active thread's own buffer already
+   exceeds the LLC - the whole ramp is memory-bound, not just the tail.
+2. **The target NUMA node's free memory** - via
+   `/sys/devices/system/node/nodeN/meminfo` (`numactl -H` fallback). The
+   buffer is capped so that (buffer size × max threads tested) never exceeds
+   `NODE_CAPACITY_SAFE_FRACTION_PCT` (default `75`) of the node's free
+   memory - critical for small pools (e.g. a single DIMM's worth of DRAM or
+   CXL capacity), where a fully cache-defeating buffer simply won't fit. For
+   the DRAM+CXL interleave test, both nodes in the pair are checked (a
+   single per-thread buffer is split across both by ratio, and the ratio
+   varies per test), and the buffer size stays fixed across every ratio
+   tested against that pair, so results stay comparable.
+
+Every test run prints the buffer size it computed and why. If the capacity
+cap engaged, it prints a `WARNING: Buffer size capped ...` line explaining
+by how much, and `summary_report.md`/`summary_report.json` surface the same
+warning under **Observations**. When that happens, some low-core-count
+ramp points may still carry partial cache residency - trust the report's
+**Sustained BW** columns (tail-of-ramp, at the highest core count tested)
+over **Peak BW** in that case; see [Output files](#output-files-and-naming)
+below.
+
+Both knobs are overridable via environment variables if you need to
+reproduce a specific prior configuration or tune for your own risk
+tolerance: `MLC_SH_CACHE_MARGIN` (default `3`) and
+`MLC_SH_CAPACITY_FRACTION_PCT` (default `75`). To bypass auto-detection
+entirely and force a specific buffer size, use `-b <KiB>` (applies to every
+test in the run).
 
 ## Requirements
 
@@ -83,6 +132,15 @@ Runs bandwidth and latency tests on DRAM and CXL Type 3 Memory using Intel MLC
 Run with root privilege (MLC needs it)
 
 Optional args:
+
+   -b <KiB>
+      Force the MLC per-thread buffer size (KiB) instead of auto-detecting
+      it from the target CPU's LLC size and the target NUMA node's free
+      memory. Use this to override the auto-tuned value, e.g. to reproduce
+      a prior run's exact buffer size, or if auto-detection is wrong for
+      your platform. By default the buffer is sized to 3x the
+      detected last-level cache so results are DRAM/CXL-bound rather than
+      cache-resident, capped to 75% of the target node's free memory.
 
    -c <CXL NUMA Node(s)>
       Specify the NUMA Node(s) backed by CXL for testing.
@@ -218,8 +276,8 @@ disambiguate results without needing a directory structure:
 | `bw_node<N>_{seq,rand}_<PATTERN>.socket_<S>.txt` | `bandwidth` | Peak bandwidth to node `<N>` from socket `<S>` for one of the 10 fixed traffic patterns |
 | `bw_ramp.results.node_<N>.R.{seq,rand}.<ratio>.socket_<S>.csv` | `bandwidth_ramp` | Bandwidth/latency vs. core count for node `<N>` from socket `<S>` (`<ratio>` is `100:0` if `<N>` was given via `-d`, `0:100` if via `-c`) |
 | `bw_ramp_interleave.results.node_<D>.node_<C>.<W>.seq.<ratio>.socket_<S>.csv` | `bandwidth_ramp_interleave` | Bandwidth/latency vs. core count for the DRAM node `<D>` + CXL node `<C>` pair from socket `<S>`, traffic type `<W>` (W21/W23/W27), at the given DRAM:CXL ratio. Seq only — MLC's interleave path rejects random access for W21/W23/W27 |
-| `summary_report.md` | `utils/gen_report.sh` | Auto-generated Markdown summary — system info, which tests ran/succeeded, peak latency/bandwidth tables by Socket→Node and by DRAM+CXL interleave pair, and auto-detected anomalies |
-| `summary_report.json` | `utils/gen_report.sh` | Machine-readable version of `summary_report.md` — same system info, topology, tests-run, and peak-results data, for scripting (e.g. `utils/gen_compare.py`, see [Comparing two runs](#comparing-two-runs)) |
+| `summary_report.md` | `utils/gen_report.sh` | Auto-generated Markdown summary — system info, which tests ran/succeeded, peak *and sustained (tail-of-ramp)* latency/bandwidth tables by Socket→Node and by DRAM+CXL interleave pair, and auto-detected anomalies (including cache-residency artifacts and buffer-size-capped tests) |
+| `summary_report.json` | `utils/gen_report.sh` | Machine-readable version of `summary_report.md` — same system info, topology, tests-run, and peak/sustained-results data, for scripting (e.g. `utils/gen_compare.py`, see [Comparing two runs](#comparing-two-runs)) |
 
 The two CSV-producing functions (`bandwidth_ramp`, `bandwidth_ramp_interleave`)
 also write a `Socket` column (first column) into every row, so a CSV opened
@@ -281,7 +339,10 @@ The output, `comparison_report.md` by default, matches `summary_report.md`'s
 table layout — one row per Socket→Node (and per DRAM+CXL interleave pair) —
 but each metric cell shows `A → B (Δ% marker)`, where the marker is `▲`
 (better), `▼` (worse), or `~` (within the threshold). Bandwidth is
-higher-is-better, latency is lower-is-better. A **Regressions** section at
+higher-is-better, latency is lower-is-better; both Peak BW and Sustained BW
+are compared, since Peak BW can still reflect a low-core-count
+cache-residency artifact (see [Buffer sizing](#buffer-sizing)) - Sustained
+BW is the one to trust for a genuine regression. A **Regressions** section at
 the top lists every metric that crossed the threshold worse, worst first, so
 the "what changed" answer doesn't require reading every table row. Nodes
 present in only one of the two runs (e.g. comparing systems with different
